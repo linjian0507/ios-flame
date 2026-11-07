@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 58b5e69..a5dee5b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -428,6 +428,21 @@ static const uint8_t ud_dev_desc[18] = {
+ 	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
+ 	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+ };
++/*
++ * PCLM10: with sweetusbrndis=1 the device descriptor matches the stock
++ * Android composite gadget byte-for-byte in its class bytes: EF/04/01
++ * means "IAD-defined composite", which is what makes the host build a
++ * composite parent and bind the function driver to the function
++ * devnode. The 05:44 run kept the ECM-era 02/00/00: rndiscmp matched
++ * the whole device (class=Net on the parent, no function children)
++ * and the driver failed to start (CM_PROB_FAILED_START). This PC has
++ * bound the EF/04/01 topology from this very phone many times (stock
++ * USB tethering), so copying it removes the topology as a variable.
++ */
++static const uint8_t ud_dev_desc_rndis[18] = {
++	18, 1, 0x00, 0x02, 0xEF, 0x04, 0x01, 64,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
+ static const uint8_t ud_cfg_desc[80] = {
+ 	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
+ 	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
+@@ -771,8 +786,16 @@ ud_rndis_command(const uint8_t *m, uint32_t len)
+ 		ud.data_up = false;
+ 		break;                                      /* no response */
+ 	case RNDIS_MSG_QUERY: {
+-		uint32_t oid = ud_rndis_get32(m + 12);
+-		int n = len >= 28 ? ud_rndis_query_data(oid, r + 24) : -1;
++		/*
++		 * The spec's QUERY header is 20 bytes (OID at 12, info-buffer
++		 * length/offset at 16/20); the 28-byte form with a trailing
++		 * DeviceVFNDriverVersion is a Linux-gadget extension. Windows
++		 * sends the 20-byte form, which the 05:44 run rejected with
++		 * NOT_SUPPORTED, and usb8023.sys failed to start over the
++		 * unanswered OID_GEN_SUPPORTED_LIST (CM_PROB_FAILED_START).
++		 */
++		uint32_t oid = len >= 16 ? ud_rndis_get32(m + 12) : 0;
++		int n = len >= 20 ? ud_rndis_query_data(oid, r + 24) : -1;
+ 		ud_rndis_put32(r, RNDIS_MSG_QUERY | RNDIS_MSG_C);
+ 		ud_rndis_put32(r + 8, reqid);
+ 		if (n < 0) {
+@@ -792,14 +815,16 @@ ud_rndis_command(const uint8_t *m, uint32_t len)
+ 		break;
+ 	}
+ 	case RNDIS_MSG_SET: {
+-		uint32_t oid = ud_rndis_get32(m + 12);
+-		uint32_t blen = ud_rndis_get32(m + 16);
+-		uint32_t boff = ud_rndis_get32(m + 20);
++		/* same minimum-header rule as QUERY above; the multicast list
++		 * is accepted without reading its buffer (we accept all). */
++		uint32_t oid = len >= 16 ? ud_rndis_get32(m + 12) : 0;
++		uint32_t blen = len >= 20 ? ud_rndis_get32(m + 16) : 0;
++		uint32_t boff = len >= 24 ? ud_rndis_get32(m + 20) : 0;
+ 		const uint8_t *b = m + 8 + boff;
+ 		uint32_t status = RNDIS_STATUS_SUCCESS;
+ 
+ 		if (oid == RNDIS_OID_CURRENT_PACKET_FILTER && blen >= 4 &&
+-		    8 + boff + 4 <= len) {
++		    len >= 24 && 8 + boff + 4 <= len) {
+ 			ud.rndis_filter = ud_rndis_get32(b);
+ 			printf("SWEET USB: rndis packet filter %08x\n", ud.rndis_filter);
+ 			if (ud.rndis_filter && !ud.data_up) {
+@@ -885,7 +910,12 @@ ud_setup(void)
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 1: {
++			const uint8_t *dev = ud.rndis ? ud_dev_desc_rndis : ud_dev_desc;
++			memcpy(data, dev, 18);
++			n = 18;
++			break;
++		}
+ 		case 2: {
+ 			const uint8_t *cfg = ud.rndis ? ud_cfg_desc_rndis : ud_cfg_desc;
+ 			n = ud.rndis ? sizeof(ud_cfg_desc_rndis) : sizeof(ud_cfg_desc);
