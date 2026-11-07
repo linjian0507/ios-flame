@@ -1,0 +1,19 @@
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -408,6 +408,16 @@
+ #endif /* defined(__arm64__) */
+ 	}
+ 
++#if defined(__arm64__) && defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * PCLM10 has no debugger to connect to and the platform is treated as
++	 * restricted, so without this a panic reboots through
++	 * kdp_machine_reboot_type() and the text is lost. Keep the panic on
++	 * screen instead (debug.c: panic_spin_forever()).
++	 */
++	panicDebugging = TRUE;
++#endif
++
+ #if defined(__arm64__)
+ 	char kdpname[80];
+ 
