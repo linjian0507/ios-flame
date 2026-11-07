@@ -1,0 +1,118 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -33,6 +33,9 @@
+  */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
++/* Defined after sweet_spmi.h; writes the ABL's next-boot reason. */
++static void sweet_mark_bootloader(void);
++
+ #define FLAME_WDT_PA    0x17c10000
+ #define FLAME_WDT_RST   0x04
+ #define FLAME_WDT_EN    0x08
+@@ -48,6 +51,12 @@
+ 		wdt[FLAME_WDT_RST / 4] = 1;
+ 		IOSleep(FLAME_WDT_PET_S * 1000);
+ 	}
++	/*
++	 * The bite is 30 s away: set the reason now so the reset lands in
++	 * fastboot. It is written here, not in start(), so a normal boot
++	 * never touches the PMIC.
++	 */
++	sweet_mark_bootloader();
+ 	IOLog("FLAME WDT: flamereboot=%d reached, no more pets: reset follows\n", reboot_s);
+ 	for (;;) {
+ 		IOSleep(1000000);
+@@ -68,8 +77,8 @@
+ 		/*
+ 		 * The UniXNU/DarwinBoot chain has no flame shim to arm the
+ 		 * watchdog. Arm it here so a panic or a stopped pet thread
+-		 * resets the phone; the IMEM reason set in start() sends the
+-		 * next boot to fastboot.
++		 * resets the phone; sweet_mark_bootloader() sets the reason
++		 * before the pets stop.
+ 		 */
+ 		wdt[FLAME_WDT_EN / 4] = 0;
+ 		wdt[0x10 / 4] = (30 - 2) * 32765;
+@@ -98,6 +107,31 @@
+  */
+ #include "../../../bsd/dev/sweet_spmi.h"
+ 
++/*
++ * Mark the next boot as "bootloader": the IMEM restart cookie and the PMIC PON
++ * soft spare 0x88f that the ABL reads. Called only when a reset is intended
++ * (watchdog about to bite, or sweetreboot=N), never on a normal boot.
++ */
++static void
++sweet_mark_bootloader(void)
++{
++	volatile uint32_t *imem = (volatile uint32_t *)ml_io_map(0x146bf65cUL, 4);
++	if (imem != NULL) {
++		*imem = 0x77665500U;
++	}
++	if (sweet_spmi_init() == 0) {
++		uint8_t v = 0xff, after = 0xff;
++		if (sweet_spmi_read(0, 0x88f, &v) == 0) {
++			(void)sweet_spmi_write(0, 0x88f,
++			    (uint8_t)((v & 1u) | (0x02u << 1)));
++		}
++		if (sweet_spmi_read(0, 0x88f, &after) == 0) {
++			IOLog("SWEET REBOOT: PON spare %#x -> %#x\n", v, after);
++		}
++	}
++	IOLog("SWEET REBOOT: IMEM/PON restart reason=bootloader\n");
++}
++
+ #define PM8150_RTC_CTRL         0x6046
+ #define PM8150_RTC_RDATA0       0x6048
+ 
+@@ -168,10 +202,7 @@
+ {
+ 	int secs = (int)(uintptr_t)arg;
+ 	IOSleep(secs * 1000);
+-	volatile uint32_t *imem = (volatile uint32_t *)ml_io_map(0x146bf65cUL, 4);
+-	if (imem != NULL) {
+-		*imem = 0x77665500U;
+-	}
++	sweet_mark_bootloader();
+ 	IOLog("SWEET REBOOT: %d s reached, restart_reason=bootloader\n", secs);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	/*
+@@ -210,37 +241,6 @@
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	sweet_log_mirror_start();       /* crash rescue: bsd/dev/sweet_ufs.c */
+-	{
+-		/*
+-		 * Write the Qualcomm IMEM restart reason now, before anything
+-		 * can panic. If the watchdog resets the phone, the PCLM10 ABL
+-		 * reads 0x77665500 and enters fastboot.
+-		 */
+-		volatile uint32_t *imem = (volatile uint32_t *)ml_io_map(0x146bf65cUL, 4);
+-		if (imem != NULL) {
+-			*imem = 0x77665500U;
+-			IOLog("SWEET REBOOT: IMEM restart_reason=bootloader\n");
+-		}
+-	}
+-	{
+-		/*
+-		 * The PMIC PON soft spare is what the PCLM10 ABL reads to pick
+-		 * the next boot mode; the IMEM cookie alone is not enough. Set
+-		 * the same "bootloader" reason the flame shim writes, so a
+-		 * watchdog reset lands in fastboot.
+-		 */
+-		if (sweet_spmi_init() == 0) {
+-			uint8_t v = 0xff, after = 0xff;
+-			if (sweet_spmi_read(0, 0x88f, &v) == 0) {
+-				(void)sweet_spmi_write(0, 0x88f,
+-				    (uint8_t)((v & 1u) | (0x02u << 1)));
+-			}
+-			if (sweet_spmi_read(0, 0x88f, &after) == 0) {
+-				IOLog("SWEET REBOOT: PON spare %#x -> %#x\n",
+-				    v, after);
+-			}
+-		}
+-	}
+ 	IOLog("SWEET: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
