@@ -1,0 +1,107 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a5dee5b..4f9ea48 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -430,17 +430,19 @@ static const uint8_t ud_dev_desc[18] = {
+ };
+ /*
+  * PCLM10: with sweetusbrndis=1 the device descriptor matches the stock
+- * Android composite gadget byte-for-byte in its class bytes: EF/04/01
+- * means "IAD-defined composite", which is what makes the host build a
+- * composite parent and bind the function driver to the function
+- * devnode. The 05:44 run kept the ECM-era 02/00/00: rndiscmp matched
+- * the whole device (class=Net on the parent, no function children)
+- * and the driver failed to start (CM_PROB_FAILED_START). This PC has
+- * bound the EF/04/01 topology from this very phone many times (stock
+- * USB tethering), so copying it removes the topology as a variable.
++ * Android configfs gadget: bDeviceClass 0/0/0 ("composite, described per
++ * interface"). The 05:44 and 06:09 runs (02/00/00 and EF/04/01) both
++ * made Windows treat the device as a single function: rndiscmp bound to
++ * the whole device (class=Net on the parent, no MI_ children), no
++ * composite parent existed to select the configuration, and the driver
++ * failed to start (setupapi.dev.log: Start device -> 0xc0000001,
++ * CM_PROB_FAILED_START). With 0/0/0 plus a second function below, the
++ * host builds the usbccgp composite parent, selects the configuration,
++ * and binds rndiscmp to the function child -- the exact topology every
++ * Android phone has used for USB tethering on this class of PC.
+  */
+ static const uint8_t ud_dev_desc_rndis[18] = {
+-	18, 1, 0x00, 0x02, 0xEF, 0x04, 0x01, 64,
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+ 	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+ };
+ static const uint8_t ud_cfg_desc[80] = {
+@@ -468,10 +470,22 @@ static const uint8_t ud_cfg_desc[80] = {
+  * by the driver (Linux f_rndis.c says so outright); they are kept because
+  * every descriptor set Windows has accepted for this class carries them.
+  */
+-static const uint8_t ud_cfg_desc_rndis[75] = {
+-	9, 2, 75, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++/*
++ * Two IADs: the RNDIS function (interfaces 0+1) and a CDC-ACM anchor
++ * (interfaces 2+3, its notification endpoint 0x83, and a bulk pair that
++ * is described but never driven). The anchor is what makes this a
++ * multi-function composite to the host: a single-IAD device is treated
++ * as one function and its driver is bound to the whole device, which
++ * is exactly what failed in experiments C and D (no composite parent,
++ * no SET_CONFIGURATION, CM_PROB_FAILED_START). Android's tethering
++ * composites always carry a second function for the same reason. The
++ * ACM function needs no driver here: Windows either leaves it alone or
++ * binds usbser to it, and neither touches the RNDIS child.
++ */
++static const uint8_t ud_cfg_desc_rndis[142] = {
++	9, 2, 142, 0, 4, 1, 0, 0x80, 250,                /* config: 4 interfaces, 500 mA */
+ 	8, 0x0b, 0, 2, 0xef, 0x04, 0x01, 0,             /* IAD: RNDIS, interfaces 0+1 */
+-	9, 4, 0, 0, 1, 0xef, 0x04, 0x01, 0,             /* control interface: notification EP */
++	9, 4, 0, 0, 1, 0xef, 0x04, 0x01, 5,             /* control interface: notification EP */
+ 	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 (ignored) */
+ 	5, 0x24, 0x01, 0x00, 0x01,                      /* call management (ignored) */
+ 	4, 0x24, 0x02, 0x00,                            /* ACM capabilities (ignored) */
+@@ -480,10 +494,21 @@ static const uint8_t ud_cfg_desc_rndis[75] = {
+ 	9, 4, 1, 0, 2, 0xef, 0x04, 0x01, 0,             /* data interface: two bulk, no altsetting */
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++	8, 0x0b, 2, 2, 0x02, 0x02, 0x00, 0,             /* IAD: CDC-ACM, interfaces 2+3 */
++	9, 4, 2, 0, 1, 0x02, 0x02, 0x00, 6,             /* ACM control interface */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 0x03,                      /* call management: data if 3 */
++	5, 0x24, 0x02, 0x00, 0x00,                      /* ACM capabilities: none */
++	5, 0x24, 0x06, 0x02, 0x03,                      /* union: control 2, data 3 */
++	7, 5, 0x83, 0x03, 16, 0, 9,                     /* ep 0x83 interrupt IN (never driven) */
++	9, 4, 3, 0, 2, 0x0a, 0x00, 0x00, 0,             /* ACM data interface (never driven) */
++	7, 5, 0x84, 0x02, 0x00, 0x02, 0,                /* ep 0x84 bulk IN */
++	7, 5, 0x04, 0x02, 0x00, 0x02, 0,                /* ep 0x04 bulk OUT */
+ };
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
++	"RNDIS", "SERIAL",
+ };
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+ 
+@@ -883,6 +908,25 @@ ud_setup(void)
+ 	if ((type & 0x60) == 0x20) {    /* class interface request */
+ 		if (!ud.rndis) {
+ 			ok = (length == 0);   /* ECM: SET_ETHERNET_PACKET_FILTER etc. */
++		} else if (index == 2) {      /* the ACM anchor: answer its class
++		                             * requests so a bound usbser gets a
++		                             * sane device and never hangs */
++			if (req == 0x22) {    /* SET_CONTROL_LINE_STATE */
++				ok = length == 0;
++			} else if (req == 0x20) {   /* SET_LINE_CODING, data unused */
++				ok = length == 7;
++			} else if (req == 0x21 && length >= 7) {  /* GET_LINE_CODING */
++				uint8_t lc[7] = { 0x00, 0x25, 0, 0, 0, 0, 8 };  /* 9600 8N1 */
++				memcpy(data, lc, 7);
++				n = 7;
++			} else if (req == 0 || req == 1) {  /* GET_MAX/GET_MIN */
++				data[0] = 0;
++				n = 1;
++			} else if (req == 2 || req == 3 || req == 4) {
++				ok = length == 0;   /* SET_COMM_FEATURE, SET/GET_LINE_ENC */
++			} else {
++				ok = false;
++			}
+ 		} else if (req == 0) {        /* SEND_ENCAPSULATED_COMMAND */
+ 			ud.encmd_len = 0;
+ 			ok = length > 0 && length <= 512;
