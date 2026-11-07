@@ -1,0 +1,206 @@
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index 6604168..d8cf160 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -67,6 +67,10 @@
+ #include <kern/clock.h>                 /* for delay_for_interval() */
+ #include <libkern/OSAtomic.h>
+ #include <IOKit/IOPlatformExpert.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/SweetResetDiagnostics.h>
++#include <kern/misc_protos.h>
++#endif
+ #include <IOKit/IOMessage.h>
+ 
+ #include <sys/kdebug.h>
+@@ -177,16 +181,18 @@ int
+ reboot_kernel(int howto, char *message)
+ {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	/*
+-	 * Diagnostic: whoever asks for a reboot on PCLM10 gets its request
+-	 * printed and the machine stops here, so the message stays on screen
+-	 * (the console is not cleared by a reset). Remove after diagnosis.
+-	 */
+-	printf("SWEET SHUTDOWN: reboot_kernel howto=%#x message=%s\n",
+-	    howto, (message != NULL) ? message : "(null)");
+-	sync((proc_t)NULL, (void *)NULL, (int *)NULL);
+-	for (;;) {
+-		__asm__ volatile("wfe" ::: "memory");
++	if (sweet_reset_diag_enabled) {
++		char name[64] = { 0 };
++		int pid = proc_selfpid();
++		proc_selfname(name, sizeof(name));
++		kdb_printf_unbuffered("SWEET RESET DIAG: reboot pid=%d name=%s howto=%#x caller=%p message=%.256s\n",
++		    pid, name, howto, __builtin_return_address(0),
++		    (message != NULL) ? message : "(null)");
++		/* RB_PANIC requests retain their original panic text/options. */
++		if ((howto & (RB_PANIC | RB_QUICK)) != (RB_PANIC | RB_QUICK)) {
++			panic("SWEET RESET DIAG: reboot pid=%d name=%s howto=%#x message=%.256s",
++			    pid, name, howto, (message != NULL) ? message : "(null)");
++		}
+ 	}
+ #endif
+ 	int hostboot_option = 0;
+diff --git a/iokit/IOKit/SweetResetDiagnostics.h b/iokit/IOKit/SweetResetDiagnostics.h
+new file mode 100644
+index 0000000..c08f821
+--- /dev/null
++++ b/iokit/IOKit/SweetResetDiagnostics.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++#ifndef _IOKIT_SWEET_RESET_DIAGNOSTICS_H
++#define _IOKIT_SWEET_RESET_DIAGNOSTICS_H
++
++#include <IOKit/IOPlatformExpert.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Set once in panic_init from sweetresetdiag=1; off by default. */
++extern int sweet_reset_diag_enabled;
++#ifdef __cplusplus
++}
++#endif
++
++/* Never stop panic begin/sync/end, paging-off or diagnostic notifications. */
++static inline int
++sweet_reset_diag_should_stop(unsigned int type)
++{
++	if (!sweet_reset_diag_enabled) {
++		return 0;
++	}
++	switch (type) {
++	case kPEHaltCPU:
++	case kPERestartCPU:
++	case kPEHangCPU:
++	case kPEUPSDelayHaltCPU:
++	case kPEPanicRestartCPU:
++	case kPEPanicRestartCPUNoCallouts:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++#endif /* _IOKIT_SWEET_RESET_DIAGNOSTICS_H */
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 2501e27..f2acfd8 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -34,6 +34,9 @@
+ #include <IOKit/IOMessage.h>
+ #include <IOKit/IONVRAM.h>
+ #include <IOKit/IOPlatformExpert.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/SweetResetDiagnostics.h>
++#endif
+ #include <IOKit/IORangeAllocator.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/pwr_mgt/RootDomain.h>
+@@ -62,6 +65,9 @@ extern "C" {
+ #include <pexpert/pexpert.h>
+ #include <uuid/uuid.h>
+ #include <sys/sysctl.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/misc_protos.h>
++#endif
+ }
+ 
+ #define kShutdownTimeout    30 //in secs
+@@ -985,14 +991,10 @@ int
+ PEHaltRestartInternal(unsigned int type, uint32_t details)
+ {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	/*
+-	 * Diagnostic (PCLM10): every kernel-initiated halt/restart prints its
+-	 * type and stops here, so the reason stays on screen instead of the
+-	 * machine resetting. Types: 1 halt, 2 restart, 3 panic-diagnostics-done,
+-	 * 4 panic-restart, 5 ups-delay, ...
+-	 */
+-	if (type != kPEUPSDelayHaltCPU) {
+-		printf("SWEET HALT: PEHaltRestartInternal type=%u -- stopping\n", type);
++	/* Opt-in final-action gate; leave panic collection notifications alone. */
++	if (sweet_reset_diag_should_stop(type)) {
++		kdb_printf_unbuffered("SWEET RESET DIAG: terminal type=%u details=%#x caller=%p -- stopping\n",
++		    type, details, __builtin_return_address(0));
+ 		for (;;) {
+ 			__asm__ volatile("wfe" ::: "memory");
+ 		}
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0b8b184..4b3e0ba 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/SweetResetDiagnostics.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -241,6 +242,16 @@ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	sweet_log_mirror_start();       /* crash rescue: bsd/dev/sweet_ufs.c */
+ 	IOLog("SWEET: starting device-tree platform expert\n");
++	if (sweet_reset_diag_enabled) {
++		int selftest = 0;
++		IOLog("SWEET RESET DIAG: enabled (final actions only)\n");
++		PE_parse_boot_argn("sweetdiagpanic", &selftest, sizeof(selftest));
++		if (selftest == 1) {
++			panic("SWEET RESET DIAG: intentional self-test panic");
++		} else if (selftest == 2) {
++			PEHaltRestartInternal(kPERestartCPU, 0);
++		}
++	}
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 1cb2cc9..3ad6f01 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -144,6 +144,10 @@ unsigned int    halt_in_debugger = 0;
+ unsigned int    current_debugger = 0;
+ unsigned int    active_debugger = 0;
+ SECURITY_READ_ONLY_LATE(unsigned int)    panicDebugging = FALSE;
++#if defined(__arm64__) && defined(ARM64_BOARD_CONFIG_SWEET)
++/* Boot-time opt-in; shared with the terminal reset gate and reboot entry. */
++int sweet_reset_diag_enabled = 0;
++#endif
+ unsigned int    kernel_debugger_entry_count = 0;
+ 
+ #if DEVELOPMENT || DEBUG
+@@ -408,16 +412,6 @@ panic_init(void)
+ #endif /* defined(__arm64__) */
+ 	}
+ 
+-#if defined(__arm64__) && defined(ARM64_BOARD_CONFIG_SWEET)
+-	/*
+-	 * PCLM10 has no debugger to connect to and the platform is treated as
+-	 * restricted, so without this a panic reboots through
+-	 * kdp_machine_reboot_type() and the text is lost. Keep the panic on
+-	 * screen instead (debug.c: panic_spin_forever()).
+-	 */
+-	panicDebugging = TRUE;
+-#endif
+-
+ #if defined(__arm64__)
+ 	char kdpname[80];
+ 
+@@ -426,6 +420,15 @@ panic_init(void)
+ 
+ #endif /* MACH_KDP */
+ 
++#if defined(__arm64__) && defined(ARM64_BOARD_CONFIG_SWEET)
++	/* No DB_HALT: do not trap into a startup KDP connection wait. */
++	PE_parse_boot_argn("sweetresetdiag", &sweet_reset_diag_enabled,
++	    sizeof(sweet_reset_diag_enabled));
++	if (sweet_reset_diag_enabled) {
++		panicDebugging = TRUE;
++	}
++#endif
++
+ #if defined (__x86_64__)
+ 	/*
+ 	 * By default we treat Debugger() the same as calls to panic(), unless

@@ -74,6 +74,23 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      - name: Verify reset diagnostics were applied
+        run: |
+          # build.sh may skip malformed patches and still return success.
+          # Check the resulting source and compile the reset policy separately.
+          python3 tools/test-reset-diagnostics.py --source dxb/xnu
+          KERNEL=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          test -f "$KERNEL"
+          strings -a "$KERNEL" > reset-diag-strings.txt
+          grep -F 'SWEET RESET DIAG: enabled (final actions only)' reset-diag-strings.txt
+          grep -F 'SWEET RESET DIAG: intentional self-test panic' reset-diag-strings.txt
+          grep -F 'SWEET RESET DIAG: terminal type=' reset-diag-strings.txt
+          grep -F 'SWEET RESET DIAG: reboot pid=' reset-diag-strings.txt
+          if grep -F 'SWEET HALT: PEHaltRestartInternal' reset-diag-strings.txt; then
+            echo 'obsolete broad panic gate is still present' >&2
+            exit 1
+          fi
+
       - name: Package build tree for local compiles
         if: always()
         run: |

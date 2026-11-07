@@ -5,6 +5,44 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 fork: reset diagnostics audit and 0137 (2026-11-07)
+
+This section concerns OPPO PCLM10 / SM8150 via UniXNU/DarwinBoot, **not Pixel 4**.
+No HakiOS/U-Boot loader code, images, logs or toolchain are used. The phone's
+stock ABL cannot `fastboot boot`; PCLM10 experiments used `flash boot` only.
+
+- Hardware observation through 0136: iOS 16.7.16 userland has run (backboardd,
+  securityd, configd etc. visible). The first captured panic was
+  `pmap_assert_free` at the fixed RAM log mirror PA `0x1fe000000`; 0131 adds
+  `sweetlogmirror=0`. Subsequent repeated resets are **not diagnosed**.
+- The user explicitly enters fastboot manually. Do not infer bootloader
+  failure recovery or autonomous panic recovery from host enumeration.
+- Live USB ECM logging has not enumerated on PCLM10; QEMU logs are not phone
+  logs. The HakiOS `oem log/screenshot/get_staged` interface is unavailable.
+- CI `42383889397` (0136), kernel SHA-256
+  `077547515bceb73cad3af8fbff091ee149a0428541c966db249f3102231cf681`,
+  audited from that run's buildtree. The final payload matches all inputs.
+  0134's unconditional sync/spin and 0136's broad notification gate obscure
+  diagnosis. 0136 even blocks `kPEPanicBegin` before original panic collection.
+- **0137** replaces both with `sweetresetdiag=1` opt-in diagnostics: final
+  halt/restart actions only; reboot requester identity via unbuffered output;
+  preserve RB_PANIC flags/message; no sync/spin before panic collection.
+  `sweetdiagpanic=1` intentionally panics before hardware services; `=2`
+  requests a final restart to test the gate. Default remains off.
+- Source reconstruction uses the four authoritative CI sources in
+  `work/dxb/xnu`, baseline commit `40725f1a156491e9dfe7f83f2d16f5d7020893f0`, modified
+  commit `ea6cc96381ad8a22af53cff2c30228a834c501fc`. This is a four-file
+  diagnostic checkout, not a full standalone build tree.
+- `python3 tools/test-reset-diagnostics.py --source work/dxb/xnu` passes 104
+  C/C++ policy checks, including permuted enum values. This is not an XNU
+  build or a phone test. Workflow now verifies applied source and strings,
+  since the upstream build script can skip a malformed patch and still pass.
+- **Next:** build 0137 in macOS CI, run intentional panic + terminal-reset
+  controls under QEMU, verify original text is retained. Do not schedule
+  another phone flash until those controls pass. UFS console persistence
+  already exists, but safe host readback on this chain is still unavailable.
+
+
 ### WiFi IN SETTINGS: wifid, en0, iOS's own DHCP (2026-10-22, 11:15) - kernels 0123/0124
 Settings -> Wi-Fi: switch on, the home network ticked, nearby networks listed (from a
 background scan while joined), Wi-Fi icon in the status bar; configd's DHCP on **en0** is the primary

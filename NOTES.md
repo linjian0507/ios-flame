@@ -66,6 +66,11 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 ## Flame patches
 
+- PCLM10 fork 0137: opt-in `sweetresetdiag=1` final-action reset gate (leave
+  panic notifications intact), record reboot PID/name/howto/caller, and
+  `sweetdiagpanic=1/2` offline controls. Replaces flawed 0134/0136 broad stops;
+  unit tests pass, QEMU and phone execution not yet validated.
+
 - 0082 IORPC.kernelContent: Xcode 16+ iig emits it; field added (kernel only) and set at the
   two user->kernel IOUserServer dispatch sites, as in newer XNU.
 - 0083 flame basics: early console on the 0x9c400000 / 2280-row framebuffer (SWEET.h
