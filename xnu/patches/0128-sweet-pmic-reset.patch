@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -174,6 +174,23 @@
+ 	}
+ 	IOLog("SWEET REBOOT: %d s reached, restart_reason=bootloader\n", secs);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	/*
++	 * PMIC hard reset, the same path flame's shim uses: PON PS_HOLD_RESET_CTL
++	 * 0x85a / 0x85b with the reset type and its enable. This power-cycles the
++	 * SoC through the PMIC, so the ABL runs and reads the PON/IMEM reason.
++	 */
++	{
++		uint8_t ctl = 0xff, ctl2 = 0xff;
++		if (sweet_spmi_read(0, 0x85a, &ctl) == 0 &&
++		    sweet_spmi_read(0, 0x85b, &ctl2) == 0) {
++			(void)sweet_spmi_write(0, 0x85b, (uint8_t)(ctl2 & ~0x80u));
++			IOSleep(1);
++			(void)sweet_spmi_write(0, 0x85a, (uint8_t)((ctl & ~0x0fu) | 0x07u));
++			(void)sweet_spmi_write(0, 0x85b, (uint8_t)(ctl2 | 0x80u));
++			IOLog("SWEET REBOOT: PMIC hard reset ctl %#x -> 7, ctl2 %#x\n",
++			    ctl, ctl2);
++		}
++	}
+ 	/* Fallbacks if the PMIC write was refused. */
+ 	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+ 	__asm__ volatile("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
