@@ -1,0 +1,22 @@
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -176,6 +176,19 @@
+ int
+ reboot_kernel(int howto, char *message)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Diagnostic: whoever asks for a reboot on PCLM10 gets its request
++	 * printed and the machine stops here, so the message stays on screen
++	 * (the console is not cleared by a reset). Remove after diagnosis.
++	 */
++	printf("SWEET SHUTDOWN: reboot_kernel howto=%#x message=%s\n",
++	    howto, (message != NULL) ? message : "(null)");
++	sync((proc_t)NULL, (void *)NULL, (int *)NULL);
++	for (;;) {
++		__asm__ volatile("wfe" ::: "memory");
++	}
++#endif
+ 	int hostboot_option = 0;
+ 	uint64_t startTime;
+ 
