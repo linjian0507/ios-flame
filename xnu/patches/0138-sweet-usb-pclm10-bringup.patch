@@ -1,0 +1,357 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 7c05343..3a549a3 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -207,6 +207,49 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++/*
++ * Debug aid for a board whose cmd-db resource names are not known yet:
++ * print the VRM table's keys (space padding shown as _, non-printable bytes
++ * as .) with their addresses. Read-only, bounded, called once from the PCLM10
++ * USB PHY bring-up when a rail lookup missed.
++ */
++void sweet_rpmh_dump_vrm(void);
++
++void
++sweet_rpmh_dump_vrm(void)
++{
++	if (rh_map() != 0) {
++		printf("SWEET RPMH: vrm dump: cmd-db not mapped\n");
++		return;
++	}
++	printf("SWEET RPMH: vrm dump: scanning cmd-db resource keys\n");
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		if (slave != RH_VRM) {
++			continue;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if (!rh_range(entries, count * RH_DB_ENTRY)) {
++			printf("SWEET RPMH: vrm dump: malformed table %u\n", i);
++			return;
++		}
++		for (unsigned j = 0; j < count && j < 64; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			char name[9] = { 0 };
++			for (unsigned k = 0; k < 8; ++k) {
++				uint8_t ch = (uint8_t)(rh_read(rh_db, e + (k / 4) * 4) >> (8u * (k % 4)));
++				name[k] = (ch == ' ') ? '_' : ((ch >= 0x21 && ch < 0x7f) ? (char)ch : '.');
++			}
++			printf("SWEET RPMH: vrm[%u] %s addr=%#x\n", j, name, rh_read(rh_db, e + 16));
++		}
++	}
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -369,12 +412,19 @@ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges. */
++	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges.
++	 * PCLM10 USB HS PHY (hsphy@88e2000 DT): pm8150_l5 880 mV (vdd, fixed
++	 * level), pm8150_l12 1800 mV (vdda18), pm8150_l2 3000 mV (vdda33);
++	 * the space-padded spellings are the same rails against a cmd-db that
++	 * pads its keys with spaces instead of zero bytes. */
+ 	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
+ 	    (!strcmp(res, "ldoa14") && mv >= 1800 && mv <= 1840) ||
+-	    (!strcmp(res, "ldoa17") && mv >= 2856 && mv <= 3008));
++	    (!strcmp(res, "ldoa17") && mv >= 2856 && mv <= 3008) ||
++	    ((!strcmp(res, "l5") || !strcmp(res, "l5      ")) && mv == 880) ||
++	    ((!strcmp(res, "l12") || !strcmp(res, "l12     ")) && mv == 1800) ||
++	    ((!strcmp(res, "l2") || !strcmp(res, "l2      ")) && mv == 3000));
+ 	if (!ok) {
+-		printf("SWEET RPMH: %s %u mV is not an allowed touch rail\n", res ? res : "?", mv);
++		printf("SWEET RPMH: %s %u mV is not an allowed rail\n", res ? res : "?", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 1116ace..ce58d3f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -24,6 +24,7 @@
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
++#include <sys/socket.h>
+ #include <sys/sockio.h>
+ #include <net/if.h>
+ #include <net/if_types.h>
+@@ -42,11 +43,14 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_rpmh_dump_vrm(void);
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
++#define CBCR_SLEEPWAKE          (1u << 12)
+ 
+ static const struct {
+ 	const char *name;
+@@ -75,10 +79,69 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * PCLM10: the stock ABL uses this controller for fastboot and may leave the
++ * power domain and the clocks off when it boots an OS normally (flame's
++ * EDK2 left them on, which is why this driver never needed any of this;
++ * measured 2026-11-08: with sweetusb=2 the host never saw even a connection,
++ * and the kernel returned to fastboot alive, i.e. the probe bailed out on
++ * the unpowered/unclocked check below). sweetusbbring=1 powers the domain
++ * and enables the gates first, the way Linux qcom_gdsc_enable and the clock
++ * gate driver do: GDSCR gets PWR_ON|BCR_RESET and is polled for PWR_ON; a
++ * gated CBCR gets CLK_OFF (and SLEEPWAKE) cleared and is polled for
++ * CLK_OFF. Every parent of these gates is an XO-derived or always-on
++ * config-NoC clock on this SoC, so no RCG programming is needed.
++ */
++static int
++usb_bring_up(vm_offset_t gcc)
++{
++	int i;
++
++	if (!(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31))) {
++		*(volatile uint32_t *)(gcc + GCC_USB30_PRIM_GDSCR) = (1u << 31) | 1u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 2000; i++) {
++			if (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)) {
++				break;
++			}
++			delay(100);
++		}
++		printf("SWEET USB: bring: GDSC usb30_prim %s\n",
++		    (i < 2000) ? "powered on" : "FAILED to power on");
++		if (i >= 2000) {
++			return -1;
++		}
++	}
++	for (unsigned c = 0; c < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); c++) {
++		uint32_t v = usb_rd(gcc, usb_cbcr[c].off);
++		int j;
++
++		if (!(v & CBCR_CLK_OFF)) {
++			continue;
++		}
++		*(volatile uint32_t *)(gcc + usb_cbcr[c].off) =
++		    v & ~(CBCR_CLK_OFF | CBCR_SLEEPWAKE);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (j = 0; j < 200; j++) {
++			if (!(usb_rd(gcc, usb_cbcr[c].off) & CBCR_CLK_OFF)) {
++				break;
++			}
++			delay(100);
++		}
++		printf("SWEET USB: bring: clk %-12s %s\n", usb_cbcr[c].name,
++		    (j < 200) ? "enabled" : "FAILED to enable");
++		if (j >= 200) {
++			return -1;
++		}
++	}
++	return 0;
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
++	int bring = 0;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+@@ -92,6 +155,11 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	PE_parse_boot_argn("sweetusbbring", &bring, sizeof(bring));
++	if (bring) {
++		printf("SWEET USB: bring: powering the domain and clocks first\n");
++		(void)usb_bring_up(gcc);
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -1020,7 +1088,18 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+  * console ring (bsd/dev/sweet_ufs.c) go as UDP datagrams to
+  * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
+  * so the boot is included. Nothing here may print (it would feed itself).
+- * Boot-arg sweetusblog=0 disables it.
++ * Boot-arg sweetusblog=0 disables it, 1 (default) is the unicast target.
++ *
++ * PCLM10: the PC may never get an address on this interface (the user is
++ * not administrator, so the flow script cannot set 192.168.7.1), and an
++ * unresolved ARP drops the datagram silently while the send itself "succeeds".
++ * sweetusblog=2 therefore sends to the limited broadcast address instead:
++ * Windows delivers that to a socket bound to 0.0.0.0:5140 with no interface
++ * configuration at all (the same mechanism as a BOOTP reply), and 3 sends
++ * both. Two more fixes apply to every mode: a chunk whose sends all failed
++ * must not consume the log position (the old code advanced it before the
++ * send, so the boot replay was lost while ARP resolved), and the replay is
++ * paced 10 ms per datagram so the host's socket buffer can keep up.
+  */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+@@ -1030,15 +1109,20 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	static char chunk[1400];
+ 	socket_t so = NULL;
+-	struct sockaddr_in to;
++	struct sockaddr_in to, bc;
++	int one = 1;
++	int logmode = 1;
+ 	uint64_t pos = sweet_log_position();
+ 
++	PE_parse_boot_argn("sweetusblog", &logmode, sizeof(logmode));
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+ 	to.sin_port = htons(5140);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++	bc = to;
++	bc.sin_addr.s_addr = 0xffffffffu;               /* limited broadcast */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+ 		if (!ud.configured) {
+@@ -1048,17 +1132,37 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			so = NULL;
+ 			continue;
+ 		}
++		if (logmode >= 2) {
++			(void)sock_setsockopt(so, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
++		}
+ 		uint32_t n;
+-		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
++		uint64_t try_pos = pos;
++		while ((n = sweet_log_copy(&try_pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+-				.msg_name = &to, .msg_namelen = sizeof(to),
+ 				.msg_iov = &iov, .msg_iovlen = 1,
+ 			};
+ 			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++			bool any = false;
++			if (logmode != 2) {
++				msg.msg_name = &to;
++				msg.msg_namelen = sizeof(to);
++				if (sock_send(so, &msg, 0, &sent) == 0) {
++					any = true;
++				}
+ 			}
++			if (logmode >= 2) {
++				msg.msg_name = &bc;
++				msg.msg_namelen = sizeof(bc);
++				if (sock_send(so, &msg, 0, &sent) == 0) {
++					any = true;
++				}
++			}
++			if (!any) {
++				break;          /* nothing got out: retry this chunk later */
++			}
++			pos = try_pos;
++			ud_sleep_ms(10);
+ 		}
+ 	}
+ }
+@@ -1102,6 +1206,24 @@ ud_smmu_setup(uint64_t dma_pa)
+ 			used[(c & 0xff) / 64] |= 1ULL << ((c & 0xff) % 64);
+ 		}
+ 		if (((0x140 ^ (m & 0x7fff)) & ~((m >> 16) & 0x7fff) & 0x7fff) == 0) {
++			/*
++			 * PCLM10: the stock ABL may leave its fastboot stream-match
++			 * entry in place (flame's EDK2 removed it, which is why this
++			 * driver used to refuse any match outright). If the context
++			 * bank it points at does no translation (ABL's own banks read
++			 * SCTLR 0xe0, CBAR 0x1f000: physical addresses), that is
++			 * exactly what this driver wants, so accept it; a translating
++			 * bank would fault our physical TRBs, so keep refusing that.
++			 */
++			unsigned cb0 = c & 0xff;
++			vm_offset_t cbv = as + cbbase + cb0 * pagesz;
++			if (((c >> 16) & 3) == 0 && !(usb_rd(cbv, 0) & 1)) {
++				ud_smmu_cb = cbv;
++				printf("SWEET USB: SMMU smr%u %x already matches 0x140 through cb%u "
++				    "(cbar %x sctlr %x: translation off, using it as is)\n",
++				    i, m, cb0, usb_rd(as, pagesz + 4 * cb0), usb_rd(cbv, 0));
++				return 0;
++			}
+ 			printf("SWEET USB: SMMU smr%u %x already matches 0x140 (s2cr %x)\n", i, m, c);
+ 			return -1;
+ 		}
+@@ -1248,15 +1370,61 @@ ud_hsphy_dump(vm_offset_t p, const char *when)
+ 	    usb_rd(p, HP_CFG0), usb_rd(p, HP_REFCLK));
+ }
+ 
++/*
++ * PCLM10 DT hsphy@88e2000 supplies: pm8150_l5 (vdd, fixed 880 mV),
++ * pm8150_l12 (vdda18, 1800 mV), pm8150_l2 (vdda33, 3000 mV). The cmd-db
++ * resource names for this firmware are not known: try the plain names the
++ * Linux lpmh regulator driver uses for PM8150 LDOs, and if those miss also
++ * the space-padded spelling (rh_lookup zero-pads its key; a table that
++ * pads with spaces needs the other form), then dump the VRM table once so
++ * the real names reach the log. A miss is not fatal: behind the fastboot
++ * path we actually boot, ABL may well have left the rails voted, and the
++ * PHY register block is reachable through the phy-aux clock we enabled.
++ */
++static void
++ud_hsphy_power(void)
++{
++	static const struct { const char *res; unsigned mv; } rails[] = {
++		{ "l5", 880 }, { "l12", 1800 }, { "l2", 3000 },
++	};
++	bool missed = false;
++
++	for (unsigned r = 0; r < sizeof(rails) / sizeof(rails[0]); r++) {
++		bool ok = false;
++		for (int pad = 0; pad < 2 && !ok; pad++) {
++			char name[9];
++			snprintf(name, sizeof(name), pad ? "%-8s" : "%s", rails[r].res);
++			if (sweet_rpmh_vreg_enable(name, rails[r].mv) == 0) {
++				printf("SWEET USB: hsphy rail %s %u mV voted%s\n", name,
++				    rails[r].mv, pad ? " (space-padded key)" : "");
++				ok = true;
++			}
++		}
++		if (!ok) {
++			printf("SWEET USB: hsphy rail %s not voted (already on, or name unknown)\n",
++			    rails[r].res);
++			missed = true;
++		}
++	}
++	if (missed) {
++		sweet_rpmh_dump_vrm();
++	}
++}
++
+ static void
+ ud_hsphy_init(void)
+ {
+ 	int doinit = 1;
++	int power = 0;
+ 	PE_parse_boot_argn("sweethsphy", &doinit, sizeof(doinit));
++	PE_parse_boot_argn("sweetusbphy", &power, sizeof(power));
+ 	vm_offset_t p = ml_io_map(HSPHY_PA, 0x1000);
+ 	if (!p) {
+ 		return;
+ 	}
++	if (power) {
++		ud_hsphy_power();
++	}
+ 	ud_hsphy_dump(p, "as ABL left it");
+ 	if (!doinit) {
+ 		return;
