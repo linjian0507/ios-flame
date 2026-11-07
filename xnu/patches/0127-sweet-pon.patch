@@ -1,0 +1,121 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -204,6 +204,25 @@
+ 			IOLog("SWEET REBOOT: IMEM restart_reason=bootloader\n");
+ 		}
+ 	}
++	{
++		/*
++		 * The PMIC PON soft spare is what the PCLM10 ABL reads to pick
++		 * the next boot mode; the IMEM cookie alone is not enough. Set
++		 * the same "bootloader" reason the flame shim writes, so a
++		 * watchdog reset lands in fastboot.
++		 */
++		if (sweet_spmi_init() == 0) {
++			uint8_t v = 0xff, after = 0xff;
++			if (sweet_spmi_read(0, 0x88f, &v) == 0) {
++				(void)sweet_spmi_write(0, 0x88f,
++				    (uint8_t)((v & 1u) | (0x02u << 1)));
++			}
++			if (sweet_spmi_read(0, 0x88f, &after) == 0) {
++				IOLog("SWEET REBOOT: PON spare %#x -> %#x\n",
++				    v, after);
++			}
++		}
++	}
+ 	IOLog("SWEET: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -18,6 +18,8 @@
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++/* Read/write lanes: one 64 KiB channel per APID (spmi-pmic-arb.c). */
++#define SP_CHNLS_PA 0x0c600000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -87,11 +89,12 @@
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
++	/* Restrict access to the battery blocks, PON (0x08) and the RTC (0x60); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
++	    (peripheral != 0x08 && peripheral != 0x10 && peripheral != 0x11 &&
++	    peripheral != 0x12 && peripheral != 0x13 && peripheral != 0x48 &&
++	    peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -124,4 +127,54 @@
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * One-byte write for the PMIC PON block. The ABL turns PON soft spare 0x88f
++ * into the boot mode it selects next, so the kernel writes the same "bootloader"
++ * reason the flame shim does. Only the PON peripheral is writable here, and
++ * only when the apps EE owns its APID (the write lane is EE-specific).
++ */
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
++{
++	unsigned peripheral = addr >> 8;
++	if (!sp_ready || sid != 0 || addr > 0xffffu || peripheral != 0x08) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	if (owner != 0) {
++		printf("SWEET BATTERY: SPMI write %#x refused, APID %u owner %u\n",
++		    addr, apid, owner);
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	vm_offset_t ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (ch == 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = val; /* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (addr & 0xffu) << 4; /* EXT_WRITEL */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = *(volatile uint32_t *)(ch + 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET BATTERY: SPMI write timeout addr=%#x APID=%u disabled\n",
++	    addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* PMIC PON block only (peripheral 0x08): the ABL's boot-reason byte. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif
