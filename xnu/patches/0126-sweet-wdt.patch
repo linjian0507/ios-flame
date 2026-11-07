@@ -1,0 +1,42 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -65,8 +65,18 @@
+ 		return;
+ 	}
+ 	if (!(wdt[FLAME_WDT_EN / 4] & 1)) {
+-		IOLog("FLAME WDT: not armed by the shim\n");
+-		return;
++		/*
++		 * The UniXNU/DarwinBoot chain has no flame shim to arm the
++		 * watchdog. Arm it here so a panic or a stopped pet thread
++		 * resets the phone; the IMEM reason set in start() sends the
++		 * next boot to fastboot.
++		 */
++		wdt[FLAME_WDT_EN / 4] = 0;
++		wdt[0x10 / 4] = (30 - 2) * 32765;
++		wdt[0x14 / 4] = 30 * 32765;
++		wdt[FLAME_WDT_RST / 4] = 1;
++		wdt[FLAME_WDT_EN / 4] = 1;
++		IOLog("FLAME WDT: armed by the kernel (30 s bite)\n");
+ 	}
+ 	wdt[FLAME_WDT_RST / 4] = 1;
+ 	if (!enabled) {
+@@ -182,6 +192,18 @@
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	sweet_log_mirror_start();       /* crash rescue: bsd/dev/sweet_ufs.c */
++	{
++		/*
++		 * Write the Qualcomm IMEM restart reason now, before anything
++		 * can panic. If the watchdog resets the phone, the PCLM10 ABL
++		 * reads 0x77665500 and enters fastboot.
++		 */
++		volatile uint32_t *imem = (volatile uint32_t *)ml_io_map(0x146bf65cUL, 4);
++		if (imem != NULL) {
++			*imem = 0x77665500U;
++			IOLog("SWEET REBOOT: IMEM restart_reason=bootloader\n");
++		}
++	}
+ 	IOLog("SWEET: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
