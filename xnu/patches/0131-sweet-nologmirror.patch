@@ -1,0 +1,23 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -737,6 +737,20 @@
+ void
+ sweet_log_mirror_start(void)
+ {
++	/*
++	 * The mirror sits above XNU's declared range on flame, but on PCLM10
++	 * 0x1fe000000 is inside the memory the VM later frees: pmap_assert_free
++	 * fires ("Found at least one mapping to 0x1fe000000 ... Kernel CPU
++	 * mapping") once iOS userspace is up. The mirror only feeds the flame
++	 * shim's crash rescue, which this chain does not have, so it is
++	 * disabled on PCLM10 with sweetlogmirror=0.
++	 */
++	int mirror_enabled = 1;
++	PE_parse_boot_argn("sweetlogmirror", &mirror_enabled, sizeof(mirror_enabled));
++	if (!mirror_enabled) {
++		printf("SWEET LOG: uncached mirror disabled (sweetlogmirror=0)\n");
++		return;
++	}
+ 	extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ 	vm_offset_t m = ml_io_map_wcomb((vm_offset_t)SWEET_MIRROR_PA, 0x1000 + SWEET_LOG_SIZE);
+ 	if (!m) {
