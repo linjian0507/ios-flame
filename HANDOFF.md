@@ -31,7 +31,7 @@ stock ABL cannot `fastboot boot`; PCLM10 experiments used `flash boot` only.
   requests a final restart to test the gate. Default remains off.
 - Source reconstruction uses the four authoritative CI sources in
   `work/dxb/xnu`, baseline commit `40725f1a156491e9dfe7f83f2d16f5d7020893f0`, modified
-  commit `ea6cc96381ad8a22af53cff2c30228a834c501fc`. This is a four-file
+  commit `1c17e5f72e97e431eea6c29d62fff1918b48cf4d`. This is a four-file
   diagnostic checkout, not a full standalone build tree.
 - `python3 tools/test-reset-diagnostics.py --source work/dxb/xnu` passes 104
   C/C++ policy checks, including permuted enum values. This is not an XNU
@@ -41,6 +41,10 @@ stock ABL cannot `fastboot boot`; PCLM10 experiments used `flash boot` only.
   controls under QEMU, verify original text is retained. Do not schedule
   another phone flash until those controls pass. UFS console persistence
   already exists, but safe host readback on this chain is still unavailable.
+- First CI `42387869872` failed compiling the two reset entries because
+  `kern/misc_protos.h` is not exported to their build views. The corrected
+  shared header declares the existing `kdb_printf_unbuffered` C symbol;
+  no full osfmk internal header is imported. Classifier tests still pass.
 
 
 ### WiFi IN SETTINGS: wifid, en0, iOS's own DHCP (2026-10-22, 11:15) - kernels 0123/0124

@@ -1,19 +1,18 @@
 diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
-index 6604168..d8cf160 100644
+index 6604168..5900652 100644
 --- a/bsd/kern/kern_shutdown.c
 +++ b/bsd/kern/kern_shutdown.c
-@@ -67,6 +67,10 @@
+@@ -67,6 +67,9 @@
  #include <kern/clock.h>                 /* for delay_for_interval() */
  #include <libkern/OSAtomic.h>
  #include <IOKit/IOPlatformExpert.h>
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <IOKit/SweetResetDiagnostics.h>
-+#include <kern/misc_protos.h>
 +#endif
  #include <IOKit/IOMessage.h>
  
  #include <sys/kdebug.h>
-@@ -177,16 +181,18 @@ int
+@@ -177,16 +180,18 @@ int
  reboot_kernel(int howto, char *message)
  {
  #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -44,10 +43,10 @@ index 6604168..d8cf160 100644
  	int hostboot_option = 0;
 diff --git a/iokit/IOKit/SweetResetDiagnostics.h b/iokit/IOKit/SweetResetDiagnostics.h
 new file mode 100644
-index 0000000..c08f821
+index 0000000..3ebc8bc
 --- /dev/null
 +++ b/iokit/IOKit/SweetResetDiagnostics.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,39 @@
 +/* SPDX-License-Identifier: APSL-2.0 */
 +#ifndef _IOKIT_SWEET_RESET_DIAGNOSTICS_H
 +#define _IOKIT_SWEET_RESET_DIAGNOSTICS_H
@@ -59,6 +58,9 @@ index 0000000..c08f821
 +#endif
 +/* Set once in panic_init from sweetresetdiag=1; off by default. */
 +extern int sweet_reset_diag_enabled;
++/* Implemented in osfmk/kern/printf.c; internal header is not exported to IOKit. */
++extern int kdb_printf_unbuffered(const char *format, ...)
++    __attribute__((format(printf, 1, 2)));
 +#ifdef __cplusplus
 +}
 +#endif
@@ -85,7 +87,7 @@ index 0000000..c08f821
 +
 +#endif /* _IOKIT_SWEET_RESET_DIAGNOSTICS_H */
 diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
-index 2501e27..f2acfd8 100644
+index 2501e27..465502c 100644
 --- a/iokit/Kernel/IOPlatformExpert.cpp
 +++ b/iokit/Kernel/IOPlatformExpert.cpp
 @@ -34,6 +34,9 @@
@@ -98,17 +100,7 @@ index 2501e27..f2acfd8 100644
  #include <IOKit/IORangeAllocator.h>
  #include <IOKit/IOWorkLoop.h>
  #include <IOKit/pwr_mgt/RootDomain.h>
-@@ -62,6 +65,9 @@ extern "C" {
- #include <pexpert/pexpert.h>
- #include <uuid/uuid.h>
- #include <sys/sysctl.h>
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+#include <kern/misc_protos.h>
-+#endif
- }
- 
- #define kShutdownTimeout    30 //in secs
-@@ -985,14 +991,10 @@ int
+@@ -985,14 +988,10 @@ int
  PEHaltRestartInternal(unsigned int type, uint32_t details)
  {
  #if defined(ARM64_BOARD_CONFIG_SWEET)
