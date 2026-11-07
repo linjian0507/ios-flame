@@ -1,0 +1,52 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -145,6 +145,36 @@
+ 	}
+ }
+ 
++
++/*
++ * P3 automation: after `sweetreboot=N` seconds, write the Qualcomm IMEM
++ * restart reason and reset. The PCLM10 ABL turns 0x77665500 into fastboot.
++ * This is needed when the kernel is booted through UniXNU/DarwinBoot: the
++ * flame shim, which normally arms the watchdog and sets the reason, is not
++ * in that chain.
++ */
++static void
++sweet_reboot_thread(void *arg)
++{
++	int secs = (int)(uintptr_t)arg;
++	IOSleep(secs * 1000);
++	volatile uint32_t *imem = (volatile uint32_t *)ml_io_map(0x146bf65cUL, 4);
++	if (imem != NULL) {
++		*imem = 0x77665500U;
++	}
++	IOLog("SWEET REBOOT: %d s reached, restart_reason=bootloader\n", secs);
++	__asm__ volatile("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++	__asm__ volatile("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
++	volatile uint32_t *pshold = (volatile uint32_t *)ml_io_map(0x0c264000UL, 4);
++	if (pshold != NULL) {
++		*pshold = 0;
++	}
++	for (;;) {
++		IOSleep(1000);
++	}
++}
++
+ extern "C" void sweet_log_mirror_start(void);
+ extern "C" void sweet_poke_start(void);
+ 
+@@ -157,6 +187,12 @@
+ 		return false;
+ 	}
+ 	flame_wdt_start();
++	int reboot_s = 0;
++	PE_parse_boot_argn("sweetreboot", &reboot_s, sizeof(reboot_s));
++	if (reboot_s > 0) {
++		IOCreateThread(sweet_reboot_thread, (void *)(uintptr_t)reboot_s);
++		IOLog("SWEET REBOOT: will reset to fastboot in %d s\n", reboot_s);
++	}
+ 	sweet_poke_start();             /* register scripts: bsd/dev/sweet_poke.c */
+ 	uint32_t rtc = 0;
+ 	uint8_t ctrl = 0;
