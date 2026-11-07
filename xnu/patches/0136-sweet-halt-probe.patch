@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -984,6 +984,20 @@
+ int
+ PEHaltRestartInternal(unsigned int type, uint32_t details)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Diagnostic (PCLM10): every kernel-initiated halt/restart prints its
++	 * type and stops here, so the reason stays on screen instead of the
++	 * machine resetting. Types: 1 halt, 2 restart, 3 panic-diagnostics-done,
++	 * 4 panic-restart, 5 ups-delay, ...
++	 */
++	if (type != kPEUPSDelayHaltCPU) {
++		printf("SWEET HALT: PEHaltRestartInternal type=%u -- stopping\n", type);
++		for (;;) {
++			__asm__ volatile("wfe" ::: "memory");
++		}
++	}
++#endif
+ 	IOPMrootDomain    *pmRootDomain;
+ 	AbsoluteTime      deadline;
+ 	thread_call_t     shutdown_hang;
