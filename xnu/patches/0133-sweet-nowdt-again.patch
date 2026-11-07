@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -76,19 +76,15 @@
+ 	}
+ 	if (!(wdt[FLAME_WDT_EN / 4] & 1)) {
+ 		/*
+-		 * The UniXNU/DarwinBoot chain has no flame shim to arm the
+-		 * watchdog, so arm it here. A panic or a stopped pet thread then
+-		 * resets the phone through the PMIC; the reason written by
+-		 * sweet_mark_bootloader() makes the ABL enter fastboot. The
+-		 * earlier "arming hangs" result was the missing
+-		 * /chosen/darwinboot-memory-size, not this block.
++		 * Never arm the APSS watchdog from the kernel on PCLM10: the
++		 * hardware bites ~30 s after the arm regardless of the pet
++		 * register (flamewdt=0 cannot stop it either), which turned every
++		 * boot into a reset loop. A panic therefore halts on screen; the
++		 * timed return to fastboot comes from sweetreboot=N (PMIC hard
++		 * reset) while the kernel is alive.
+ 		 */
+-		wdt[FLAME_WDT_EN / 4] = 0;
+-		wdt[0x10 / 4] = (30 - 2) * 32765;
+-		wdt[0x14 / 4] = 30 * 32765;
+-		wdt[FLAME_WDT_RST / 4] = 1;
+-		wdt[FLAME_WDT_EN / 4] = 1;
+-		IOLog("FLAME WDT: armed by the kernel (30 s bite)\n");
++		IOLog("FLAME WDT: not armed (PCLM10 cannot disable it)\n");
++		return;
+ 	}
+ 	wdt[FLAME_WDT_RST / 4] = 1;
+ 	if (!enabled) {
