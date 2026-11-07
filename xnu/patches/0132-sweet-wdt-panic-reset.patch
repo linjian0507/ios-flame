@@ -1,0 +1,52 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -47,16 +47,17 @@
+ 	volatile uint32_t *wdt = (volatile uint32_t *)arg;
+ 	int reboot_s = 0;
+ 	PE_parse_boot_argn("flamereboot", &reboot_s, sizeof(reboot_s));
++	/*
++	 * Record the next-boot reason before anything can panic. A panic stops
++	 * this thread, the watchdog bites 30 s later and the PMIC reset lands in
++	 * fastboot because the reason is already written. Doing it here (a
++	 * thread, after start()) keeps it out of the early boot path.
++	 */
++	sweet_mark_bootloader();
+ 	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += FLAME_WDT_PET_S) {
+ 		wdt[FLAME_WDT_RST / 4] = 1;
+ 		IOSleep(FLAME_WDT_PET_S * 1000);
+ 	}
+-	/*
+-	 * The bite is 30 s away: set the reason now so the reset lands in
+-	 * fastboot. It is written here, not in start(), so a normal boot
+-	 * never touches the PMIC.
+-	 */
+-	sweet_mark_bootloader();
+ 	IOLog("FLAME WDT: flamereboot=%d reached, no more pets: reset follows\n", reboot_s);
+ 	for (;;) {
+ 		IOSleep(1000000);
+@@ -75,13 +76,19 @@
+ 	}
+ 	if (!(wdt[FLAME_WDT_EN / 4] & 1)) {
+ 		/*
+-		 * Only the flame shim used to arm this block. Writing it from the
+-		 * kernel hung the PCLM10 early in start() (no SWEET log reached
+-		 * the screen), so an unarmed watchdog is left alone: the reset
+-		 * comes from sweetreboot=N and the PMIC hard reset instead.
++		 * The UniXNU/DarwinBoot chain has no flame shim to arm the
++		 * watchdog, so arm it here. A panic or a stopped pet thread then
++		 * resets the phone through the PMIC; the reason written by
++		 * sweet_mark_bootloader() makes the ABL enter fastboot. The
++		 * earlier "arming hangs" result was the missing
++		 * /chosen/darwinboot-memory-size, not this block.
+ 		 */
+-		IOLog("FLAME WDT: not armed (kernel does not arm it)\n");
+-		return;
++		wdt[FLAME_WDT_EN / 4] = 0;
++		wdt[0x10 / 4] = (30 - 2) * 32765;
++		wdt[0x14 / 4] = 30 * 32765;
++		wdt[FLAME_WDT_RST / 4] = 1;
++		wdt[FLAME_WDT_EN / 4] = 1;
++		IOLog("FLAME WDT: armed by the kernel (30 s bite)\n");
+ 	}
+ 	wdt[FLAME_WDT_RST / 4] = 1;
+ 	if (!enabled) {
