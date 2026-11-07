@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -75,17 +75,13 @@
+ 	}
+ 	if (!(wdt[FLAME_WDT_EN / 4] & 1)) {
+ 		/*
+-		 * The UniXNU/DarwinBoot chain has no flame shim to arm the
+-		 * watchdog. Arm it here so a panic or a stopped pet thread
+-		 * resets the phone; sweet_mark_bootloader() sets the reason
+-		 * before the pets stop.
++		 * Only the flame shim used to arm this block. Writing it from the
++		 * kernel hung the PCLM10 early in start() (no SWEET log reached
++		 * the screen), so an unarmed watchdog is left alone: the reset
++		 * comes from sweetreboot=N and the PMIC hard reset instead.
+ 		 */
+-		wdt[FLAME_WDT_EN / 4] = 0;
+-		wdt[0x10 / 4] = (30 - 2) * 32765;
+-		wdt[0x14 / 4] = 30 * 32765;
+-		wdt[FLAME_WDT_RST / 4] = 1;
+-		wdt[FLAME_WDT_EN / 4] = 1;
+-		IOLog("FLAME WDT: armed by the kernel (30 s bite)\n");
++		IOLog("FLAME WDT: not armed (kernel does not arm it)\n");
++		return;
+ 	}
+ 	wdt[FLAME_WDT_RST / 4] = 1;
+ 	if (!enabled) {
