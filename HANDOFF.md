@@ -5,6 +5,30 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 0137 validated offline, first diagnostic phone boot pending (2026-11-08 00:29)
+
+- Corrected CI `42389009193` passed build and applied-diagnostic checks.
+  Kernel SHA-256 `5357078efc62b94d68a704b70df3d014736ca8ef99256b906cd3e35f99d0214c`.
+- The earlier 0136 QEMU negative control stops at `type=7` before the original
+  panic text: concrete proof that its broad interception damages diagnosis.
+- 0137 controls now pass under QEMU: intentional original panic retained;
+  terminal restart intercepted as type 1. Both messages verified against
+  screen and stopped-VM console-ring bytes. 13/12 old framebuffer glyphs
+  remain undecoded, explicitly reported. Not a lossless screen test, a phone
+  log transport, or a diagnosis of the phone's repeated resets.
+- Main workspace evidence: `work/audit-0137/run3/verification.json` and
+  `work/audit-0137/packed-inputs.json`; `docs/P4-RESET-AUDIT.md` explains limits.
+- At 00:29:27 +08:00, one PCLM10 `flash boot` + reboot succeeded, image
+  SHA-256 `c2d32dc5d755127cbb9b019d04b956691417662c4cfdccd30d237e59a552a518`.
+  Packed args: `debug=0x8 sweetresetdiag=1 sweetdiagpanic=0 flamewdt=0
+  sweetreboot=0 sweetlogmirror=0 sweetusb=0 rd=ufsroot0 ufsrw=1 ufslogsecs=1`
+  plus iOS launch/ignition arguments. Packed inputs verified byte for byte.
+  No new userdata or firmware writes. **Phone result pending.**
+- Next: obtain the outcome of this single diagnostic boot. Do not claim it
+  will necessarily halt or return automatically; do not launch repeated
+  phone experiments or attribute a host fastboot endpoint to autonomous
+  recovery. The user explicitly enters fastboot manually.
+
 ### PCLM10 fork: reset diagnostics audit and 0137 (2026-11-07)
 
 This section concerns OPPO PCLM10 / SM8150 via UniXNU/DarwinBoot, **not Pixel 4**.

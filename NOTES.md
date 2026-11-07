@@ -69,7 +69,8 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - PCLM10 fork 0137: opt-in `sweetresetdiag=1` final-action reset gate (leave
   panic notifications intact), record reboot PID/name/howto/caller, and
   `sweetdiagpanic=1/2` offline controls. Replaces flawed 0134/0136 broad stops;
-  unit tests pass, QEMU and phone execution not yet validated.
+  unit tests and QEMU intentional-panic/terminal controls pass (CI 42389009193);
+  first PCLM10 diagnostic boot at 2026-11-08 00:29, phone result pending.
 
 - 0082 IORPC.kernelContent: Xcode 16+ iig emits it; field added (kernel only) and set at the
   two user->kernel IOUserServer dispatch sites, as in newer XNU.
