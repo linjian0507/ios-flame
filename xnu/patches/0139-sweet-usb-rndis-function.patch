@@ -1,0 +1,545 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ce58d3f..58b5e69 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -310,6 +310,16 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* RNDIS mode (sweetusbrndis=1): the control RPC is one command and
++	 * one answer at a time (the host serializes them), so one response
++	 * slot is enough; the notification is coalesced. */
++	int         rndis;          /* protocol switch, set once at probe */
++	uint32_t    encmd_len;      /* pending SEND_ENCAPSULATED_COMMAND data */
++	uint8_t     resp[512];      /* queued GET_ENCAPSULATED_RESPONSE answer */
++	uint32_t    resp_len, resp_ready;
++	uint32_t    rndis_filter;   /* OID_GEN_CURRENT_PACKET_FILTER */
++	bool        data_up;        /* RNDIS data path open (nonzero filter) */
++	bool        notify_busy, notify_again;
+ } ud;
+ 
+ static inline void
+@@ -430,6 +440,32 @@ static const uint8_t ud_cfg_desc[80] = {
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ };
++/*
++ * PCLM10: Windows has no in-box CDC-ECM class driver (measured 2026-11-08:
++ * the ECM function enumerated cleanly but was left with no driver, no
++ * adapter), while the in-box RNDIS package rndiscmp.inf (usb8023 +
++ * rndismp6) matches the interface class USB\Class_EF&SubClass_04&Prot_01
++ * -- the same RNDIS function the stock Android system on this phone uses
++ * for USB tethering, so this PC has bound that exact class before.
++ * sweetusbrndis=1 presents the classic Android RNDIS function instead of
++ * CDC-ECM: the same three endpoints and DMA, but RNDIS framing and the
++ * RNDIS control RPC. The ACM-flavoured functional descriptors are ignored
++ * by the driver (Linux f_rndis.c says so outright); they are kept because
++ * every descriptor set Windows has accepted for this class carries them.
++ */
++static const uint8_t ud_cfg_desc_rndis[75] = {
++	9, 2, 75, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	8, 0x0b, 0, 2, 0xef, 0x04, 0x01, 0,             /* IAD: RNDIS, interfaces 0+1 */
++	9, 4, 0, 0, 1, 0xef, 0x04, 0x01, 0,             /* control interface: notification EP */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 (ignored) */
++	5, 0x24, 0x01, 0x00, 0x01,                      /* call management (ignored) */
++	4, 0x24, 0x02, 0x00,                            /* ACM capabilities (ignored) */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes */
++	9, 4, 1, 0, 2, 0xef, 0x04, 0x01, 0,             /* data interface: two bulk, no altsetting */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
+@@ -494,7 +530,315 @@ ud_configure(void)
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	printf("SWEET USB: %s endpoints configured\n", ud.rndis ? "RNDIS" : "ECM");
++}
++
++/* ---- RNDIS control protocol (sweetusbrndis=1) ------------------------
++ * Message formats and every OID answer mirror Linux drivers/usb/gadget/
++ * function/rndis.c (rndis_msg_parser, gen_ndis_query_resp/set_resp), the
++ * code every Android phone runs against this same Windows driver, so the
++ * host accepts it. Message types INIT 2 / HALT 3 / QUERY 4 / SET 5 /
++ * RESET 6 / KEEPALIVE 8, completions set bit 31; information buffers sit
++ * at message byte 8 + InformationBufferOffset, and QUERY_COMPLETE carries
++ * its data at offset 16 (24-byte header). The device signals a queued
++ * answer with the 8-byte notification {RESPONSE_AVAILABLE=1, 0} on the
++ * interrupt endpoint; the host then drains it with GET_ENCAPSULATED_
++ * RESPONSE (one answer at a time: the host serializes commands, and
++ * RESET drains, so one slot is enough). Runs from the event thread:
++ * nothing here may block.
++ */
++#define RNDIS_MSG_PACKET      0x00000001u
++#define RNDIS_MSG_INIT        0x00000002u
++#define RNDIS_MSG_HALT        0x00000003u
++#define RNDIS_MSG_QUERY       0x00000004u
++#define RNDIS_MSG_SET         0x00000005u
++#define RNDIS_MSG_RESET       0x00000006u
++#define RNDIS_MSG_KEEPALIVE   0x00000008u
++#define RNDIS_MSG_C           0x80000000u
++#define RNDIS_STATUS_SUCCESS          0x00000000u
++#define RNDIS_STATUS_NOT_SUPPORTED    0xc00000bbu
++#define RNDIS_OID_SUPPORTED_LIST      0x00010101u
++#define RNDIS_OID_HARDWARE_STATUS     0x00010102u
++#define RNDIS_OID_MEDIA_SUPPORTED     0x00010103u
++#define RNDIS_OID_MEDIA_IN_USE        0x00010104u
++#define RNDIS_OID_MAXIMUM_FRAME_SIZE  0x00010106u
++#define RNDIS_OID_LINK_SPEED          0x00010107u
++#define RNDIS_OID_TX_BUFFER_SPACE     0x00010108u
++#define RNDIS_OID_RX_BUFFER_SPACE     0x00010109u
++#define RNDIS_OID_TX_BLOCK_SIZE       0x0001010au
++#define RNDIS_OID_RX_BLOCK_SIZE       0x0001010bu
++#define RNDIS_OID_VENDOR_ID           0x0001010cu
++#define RNDIS_OID_VENDOR_DESCRIPTION  0x0001010du
++#define RNDIS_OID_CURRENT_PACKET_FILTER 0x0001010eu
++#define RNDIS_OID_DRIVER_VERSION      0x00010110u
++#define RNDIS_OID_MAXIMUM_TOTAL_SIZE  0x00010111u
++#define RNDIS_OID_MAC_OPTIONS         0x00010113u
++#define RNDIS_OID_MEDIA_CONNECT_STATUS 0x00010114u
++#define RNDIS_OID_MAX_SEND_PACKETS    0x00010115u
++#define RNDIS_OID_VENDOR_DRIVER_VERSION 0x00010116u
++#define RNDIS_OID_PHYSICAL_MEDIUM     0x00010202u
++#define RNDIS_OID_XMIT_OK             0x00020101u
++#define RNDIS_OID_RCV_OK              0x00020102u
++#define RNDIS_OID_XMIT_ERROR          0x00020103u
++#define RNDIS_OID_RCV_ERROR           0x00020104u
++#define RNDIS_OID_RCV_NO_BUFFER       0x00020105u
++#define RNDIS_OID_802_3_PERMANENT_ADDRESS 0x01010101u
++#define RNDIS_OID_802_3_CURRENT_ADDRESS   0x01010102u
++#define RNDIS_OID_802_3_MULTICAST_LIST    0x01010103u
++#define RNDIS_OID_802_3_MAXIMUM_LIST_SIZE 0x01010104u
++#define RNDIS_OID_802_3_MAC_OPTIONS       0x01010105u
++#define RNDIS_OID_802_3_RCV_ERROR_ALIGNMENT 0x01020101u
++#define RNDIS_OID_802_3_XMIT_ONE_COLLISION  0x01020102u
++#define RNDIS_OID_802_3_XMIT_MORE_COLLISIONS 0x01020103u
++
++/* the list we advertise, same set as the Linux gadget advertises */
++static const uint32_t rndis_oids_supported[] = {
++	RNDIS_OID_SUPPORTED_LIST, RNDIS_OID_HARDWARE_STATUS,
++	RNDIS_OID_MEDIA_SUPPORTED, RNDIS_OID_MEDIA_IN_USE,
++	RNDIS_OID_MAXIMUM_FRAME_SIZE, RNDIS_OID_LINK_SPEED,
++	RNDIS_OID_TX_BLOCK_SIZE, RNDIS_OID_RX_BLOCK_SIZE,
++	RNDIS_OID_VENDOR_ID, RNDIS_OID_VENDOR_DESCRIPTION,
++	RNDIS_OID_VENDOR_DRIVER_VERSION, RNDIS_OID_CURRENT_PACKET_FILTER,
++	RNDIS_OID_MAXIMUM_TOTAL_SIZE, RNDIS_OID_MEDIA_CONNECT_STATUS,
++	RNDIS_OID_PHYSICAL_MEDIUM,
++	RNDIS_OID_XMIT_OK, RNDIS_OID_RCV_OK, RNDIS_OID_XMIT_ERROR,
++	RNDIS_OID_RCV_ERROR, RNDIS_OID_RCV_NO_BUFFER,
++	RNDIS_OID_802_3_PERMANENT_ADDRESS, RNDIS_OID_802_3_CURRENT_ADDRESS,
++	RNDIS_OID_802_3_MULTICAST_LIST, RNDIS_OID_802_3_MAC_OPTIONS,
++	RNDIS_OID_802_3_MAXIMUM_LIST_SIZE,
++	RNDIS_OID_802_3_RCV_ERROR_ALIGNMENT, RNDIS_OID_802_3_XMIT_ONE_COLLISION,
++	RNDIS_OID_802_3_XMIT_MORE_COLLISIONS,
++};
++
++static uint32_t
++ud_rndis_get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
++	    (uint32_t)p[3] << 24;
++}
++
++static void
++ud_rndis_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++
++/* RESPONSE_AVAILABLE on the interrupt endpoint; coalesced while one is
++ * in flight, the completion re-sends the rest (like f_rndis notify_count). */
++static void
++ud_rndis_notify(void)
++{
++	uint8_t *n;
++
++	if (ud.notify_busy) {
++		ud.notify_again = true;
++		return;
++	}
++	n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	ud_rndis_put32(n, 1);                       /* RESPONSE_AVAILABLE */
++	ud_rndis_put32(n + 4, 0);
++	ud.notify_busy = true;
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++}
++
++static void
++ud_rndis_reply(uint32_t len)
++{
++	ud.resp_len = len;
++	ud.resp_ready = 1;
++	ud_rndis_notify();
++}
++
++/* answer one query OID into out (space reserved to the supported-list
++ * size); returns the answer length, or -1 for RNDIS_STATUS_NOT_SUPPORTED.
++ * Values are the Linux gadget's: medium 802.3 (0), connected, 480 Mbps in
++ * units of 100 bit/s, and the 802_3 address OIDs return the host's MAC,
++ * which is what the host then uses as its own (rndis_set_host_mac). */
++static int
++ud_rndis_query_data(uint32_t oid, uint8_t *out)
++{
++	static const uint8_t host_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x01 };
++	static const char vendor[] = "Sweet iOS (RNDIS)";
++	uint32_t n = 0;
++
++	bzero(out, 4 * (sizeof(rndis_oids_supported) / sizeof(uint32_t)));
++	switch (oid) {
++	case RNDIS_OID_SUPPORTED_LIST:
++		n = sizeof(rndis_oids_supported);
++		for (unsigned i = 0; i < n / 4; i++) {
++			ud_rndis_put32(out + 4 * i, rndis_oids_supported[i]);
++		}
++		return (int)n;
++	case RNDIS_OID_HARDWARE_STATUS:
++	case RNDIS_OID_MEDIA_SUPPORTED:
++	case RNDIS_OID_MEDIA_IN_USE:
++	case RNDIS_OID_PHYSICAL_MEDIUM:
++	case RNDIS_OID_802_3_MAC_OPTIONS:
++	case RNDIS_OID_XMIT_ERROR:
++	case RNDIS_OID_RCV_ERROR:
++	case RNDIS_OID_RCV_NO_BUFFER:
++	case RNDIS_OID_802_3_RCV_ERROR_ALIGNMENT:
++	case RNDIS_OID_802_3_XMIT_ONE_COLLISION:
++	case RNDIS_OID_802_3_XMIT_MORE_COLLISIONS:
++		ud_rndis_put32(out, 0);
++		return 4;
++	case RNDIS_OID_MAXIMUM_FRAME_SIZE:
++	case RNDIS_OID_TX_BLOCK_SIZE:
++	case RNDIS_OID_RX_BLOCK_SIZE:
++		ud_rndis_put32(out, 1500);
++		return 4;
++	case RNDIS_OID_LINK_SPEED:
++		ud_rndis_put32(out, 4800000);       /* 480 Mbit/s / 100 */
++		return 4;
++	case RNDIS_OID_TX_BUFFER_SPACE:
++	case RNDIS_OID_RX_BUFFER_SPACE:
++		ud_rndis_put32(out, 65536);
++		return 4;
++	case RNDIS_OID_VENDOR_ID:
++		ud_rndis_put32(out, 0x1209);        /* pid.codes */
++		return 4;
++	case RNDIS_OID_VENDOR_DESCRIPTION:
++		n = sizeof(vendor) - 1;
++		memcpy(out, vendor, n);
++		return (int)n;
++	case RNDIS_OID_DRIVER_VERSION:
++	case RNDIS_OID_VENDOR_DRIVER_VERSION:
++		ud_rndis_put32(out, 1);
++		return 4;
++	case RNDIS_OID_CURRENT_PACKET_FILTER:
++		ud_rndis_put32(out, ud.rndis_filter);
++		return 4;
++	case RNDIS_OID_MAXIMUM_TOTAL_SIZE:
++		ud_rndis_put32(out, 1558);
++		return 4;
++	case RNDIS_OID_MAC_OPTIONS:
++		ud_rndis_put32(out, 0x12);          /* serialized RX, full duplex */
++		return 4;
++	case RNDIS_OID_MEDIA_CONNECT_STATUS:
++		ud_rndis_put32(out, 0);             /* connected */
++		return 4;
++	case RNDIS_OID_MAX_SEND_PACKETS:
++		ud_rndis_put32(out, 16);
++		return 4;
++	case RNDIS_OID_XMIT_OK:
++		ud_rndis_put32(out, (uint32_t)ud.tx_frames);
++		return 4;
++	case RNDIS_OID_RCV_OK:
++		ud_rndis_put32(out, (uint32_t)ud.rx_frames);
++		return 4;
++	case RNDIS_OID_802_3_PERMANENT_ADDRESS:
++	case RNDIS_OID_802_3_CURRENT_ADDRESS:
++		memcpy(out, host_mac, 6);
++		return 6;
++	case RNDIS_OID_802_3_MULTICAST_LIST:
++		ud_rndis_put32(out, 0xe0000000);    /* multicast base only */
++		return 4;
++	case RNDIS_OID_802_3_MAXIMUM_LIST_SIZE:
++		ud_rndis_put32(out, 1);
++		return 4;
++	default:
++		return -1;
++	}
++}
++
++/* one RNDIS control message arrived in the ep0 OUT data stage */
++static void
++ud_rndis_command(const uint8_t *m, uint32_t len)
++{
++	uint32_t type = ud_rndis_get32(m), reqid = ud_rndis_get32(m + 8);
++	uint8_t *r = ud.resp;
++
++	if (len < 8) {
++		return;
++	}
++	printf("SWEET USB: rndis msg %u len %u\n", type, len);
++	switch (type) {
++	case RNDIS_MSG_INIT:
++		bzero(r, 52);
++		ud_rndis_put32(r, RNDIS_MSG_INIT | RNDIS_MSG_C);
++		ud_rndis_put32(r + 4, 52);
++		ud_rndis_put32(r + 8, reqid);
++		ud_rndis_put32(r + 12, RNDIS_STATUS_SUCCESS);
++		ud_rndis_put32(r + 16, 1);                  /* MajorVersion */
++		ud_rndis_put32(r + 24, 1);                  /* connectionless */
++		ud_rndis_put32(r + 28, 0);                  /* medium 802.3 */
++		ud_rndis_put32(r + 32, 1);                  /* MaxPacketsPerTransfer */
++		ud_rndis_put32(r + 36, 1584);               /* MaxTransferSize */
++		ud_rndis_reply(52);
++		break;
++	case RNDIS_MSG_HALT:
++		ud.data_up = false;
++		break;                                      /* no response */
++	case RNDIS_MSG_QUERY: {
++		uint32_t oid = ud_rndis_get32(m + 12);
++		int n = len >= 28 ? ud_rndis_query_data(oid, r + 24) : -1;
++		ud_rndis_put32(r, RNDIS_MSG_QUERY | RNDIS_MSG_C);
++		ud_rndis_put32(r + 8, reqid);
++		if (n < 0) {
++			ud_rndis_put32(r + 4, 24);
++			ud_rndis_put32(r + 12, RNDIS_STATUS_NOT_SUPPORTED);
++			ud_rndis_put32(r + 16, 0);
++			ud_rndis_put32(r + 20, 0);
++			n = 0;
++		} else {
++			ud_rndis_put32(r + 4, 24 + (uint32_t)n);
++			ud_rndis_put32(r + 12, RNDIS_STATUS_SUCCESS);
++			ud_rndis_put32(r + 16, (uint32_t)n);
++			ud_rndis_put32(r + 20, 16);         /* data at 8+16 */
++		}
++		printf("SWEET USB: rndis query %08x -> %d B\n", oid, n);
++		ud_rndis_reply(24 + (uint32_t)n);
++		break;
++	}
++	case RNDIS_MSG_SET: {
++		uint32_t oid = ud_rndis_get32(m + 12);
++		uint32_t blen = ud_rndis_get32(m + 16);
++		uint32_t boff = ud_rndis_get32(m + 20);
++		const uint8_t *b = m + 8 + boff;
++		uint32_t status = RNDIS_STATUS_SUCCESS;
++
++		if (oid == RNDIS_OID_CURRENT_PACKET_FILTER && blen >= 4 &&
++		    8 + boff + 4 <= len) {
++			ud.rndis_filter = ud_rndis_get32(b);
++			printf("SWEET USB: rndis packet filter %08x\n", ud.rndis_filter);
++			if (ud.rndis_filter && !ud.data_up) {
++				ud.data_up = true;
++				ud_link_event(true);
++				printf("SWEET USB: rndis data path up\n");
++			}
++		} else if (oid == RNDIS_OID_802_3_MULTICAST_LIST) {
++			/* one multicast address: we accept all anyway */
++		} else {
++			status = RNDIS_STATUS_NOT_SUPPORTED;
++		}
++		ud_rndis_put32(r, RNDIS_MSG_SET | RNDIS_MSG_C);
++		ud_rndis_put32(r + 4, 16);
++		ud_rndis_put32(r + 8, reqid);
++		ud_rndis_put32(r + 12, status);
++		ud_rndis_reply(16);
++		break;
++	}
++	case RNDIS_MSG_RESET:
++		ud.data_up = false;
++		ud.rndis_filter = 0;
++		ud_rndis_put32(r, RNDIS_MSG_RESET | RNDIS_MSG_C);
++		ud_rndis_put32(r + 4, 16);
++		ud_rndis_put32(r + 8, RNDIS_STATUS_SUCCESS);
++		ud_rndis_put32(r + 12, 1);                  /* addressing reset */
++		ud_rndis_reply(16);
++		break;
++	case RNDIS_MSG_KEEPALIVE:
++		ud_rndis_put32(r, RNDIS_MSG_KEEPALIVE | RNDIS_MSG_C);
++		ud_rndis_put32(r + 4, 16);
++		ud_rndis_put32(r + 8, reqid);
++		ud_rndis_put32(r + 12, RNDIS_STATUS_SUCCESS);
++		ud_rndis_reply(16);
++		break;
++	default:
++		printf("SWEET USB: rndis unknown msg %u\n", type);
++		break;
++	}
+ }
+ 
+ static void
+@@ -511,14 +855,43 @@ ud_setup(void)
+ 
+ 	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++	if ((type & 0x60) == 0x20) {    /* class interface request */
++		if (!ud.rndis) {
++			ok = (length == 0);   /* ECM: SET_ETHERNET_PACKET_FILTER etc. */
++		} else if (req == 0) {        /* SEND_ENCAPSULATED_COMMAND */
++			ud.encmd_len = 0;
++			ok = length > 0 && length <= 512;
++			if (ok) {
++				ud.encmd_len = length;
++			}
++		} else if (req == 1) {        /* GET_ENCAPSULATED_RESPONSE */
++			if (ud.resp_ready && length > 0) {
++				n = ud.resp_len > length ? length : ud.resp_len;
++				memcpy(data, ud.resp, n);
++				ud.resp_ready = 0;
++			} else {
++				ok = false;   /* nothing queued: stall, as f_rndis does */
++			}
++		} else if (req == 5) {        /* SET_ETHERNET_PACKET_FILTER (wValue) */
++			ud.rndis_filter = value;
++			ok = length == 0;
++		} else if (req == 2 || req == 3 || req == 4 ||
++		    req == 6 || req == 7 || req == 8) {
++			ok = length == 0;   /* comm features, multicast filters */
++		} else {
++			ok = false;
++		}
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+ 		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 2: {
++			const uint8_t *cfg = ud.rndis ? ud_cfg_desc_rndis : ud_cfg_desc;
++			n = ud.rndis ? sizeof(ud_cfg_desc_rndis) : sizeof(ud_cfg_desc);
++			memcpy(data, cfg, n);
++			break;
++		}
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -538,7 +911,10 @@ ud_setup(void)
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
++			/* ECM brings its link up on alt 1; RNDIS has no
++			 * altsettings and opens its data path on a nonzero
++			 * packet filter (handled in ud_rndis_command). */
++			if (value == 1 && ud.configured && !ud.rndis) {
+ 				ud_notify_connected();
+ 				ud_link_event(true);
+ 			}
+@@ -564,7 +940,9 @@ ud_setup(void)
+ 		}
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++		/* RNDIS: the SEND_ENCAPSULATED_COMMAND message, processed
++		 * when the data stage completes; otherwise unused. */
++		ud_start(0, UD_DATA, ud.encmd_len ? ud.encmd_len : 64, TRBCTL_DATA);
+ 	}
+ }
+ 
+@@ -614,6 +992,20 @@ ud_rx_done(void)
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	ud_log_frame("rx", (const uint8_t *)(ud.dma + UD_RX), len);
++	/* RNDIS: unwrap the packet message (frame at 8 + DataOffset,
++	 * DataLength bytes; Linux rndis_rm_hdr). */
++	const uint8_t *frame = (const uint8_t *)(ud.dma + UD_RX);
++	if (ud.rndis) {
++		uint32_t off, dlen;
++		if (len < 44 || ud_rndis_get32(frame) != RNDIS_MSG_PACKET ||
++		    (off = 8 + ud_rndis_get32(frame + 8)) > len ||
++		    (dlen = ud_rndis_get32(frame + 12)) > len - off) {
++			ud_rx_arm();
++			return;
++		}
++		frame += off;
++		len = dlen;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -625,7 +1017,7 @@ ud_rx_done(void)
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+ 			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			memcpy(mbuf_data(m), frame, len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -677,6 +1069,21 @@ ud_tx_kick_locked(void)
+ 		while (len < 60) {
+ 			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+ 		}
++		/*
++		 * RNDIS carries each frame in a packet message: 44-byte header
++		 * (Linux rndis_add_hdr: DataOffset 36, measured from byte 8 of
++		 * the message) ahead of the unmodified Ethernet frame. The host
++		 * trims to DataLength, so the padding above is dropped there.
++		 */
++		if (ud.rndis && len + 44 <= UD_FRAME_MAX) {
++			memmove(fr + 44, fr, len);
++			bzero(fr, 44);
++			ud_rndis_put32(fr, RNDIS_MSG_PACKET);
++			ud_rndis_put32(fr + 4, (uint32_t)len + 44);
++			ud_rndis_put32(fr + 8, 36);
++			ud_rndis_put32(fr + 12, (uint32_t)len);
++			len += 44;
++		}
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+ 		if ((len % 512) == 0) {
+@@ -870,6 +1277,14 @@ ud_event(uint32_t ev)
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	if (ep == EP_INT && type == 1) {
++		ud.notify_busy = false;
++		if (ud.notify_again) {    /* another answer queued meanwhile */
++			ud.notify_again = false;
++			ud_rndis_notify();
++		}
++		return;
++	}
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -886,6 +1301,19 @@ ud_event(uint32_t ev)
+ 			ud_setup();
+ 			break;
+ 		case EP0_DATA:
++			if (ud.encmd_len) {   /* RNDIS command fully received */
++				volatile uint32_t *t =
++				    (volatile uint32_t *)(ud.dma + UD_TRB_OUT);
++				uint32_t got;
++				ud_sync(UD_TRB_OUT, 16);
++				got = ud.encmd_len - (t[2] & 0xffffff);
++				if (got > ud.encmd_len) {
++					got = ud.encmd_len;
++				}
++				ud_sync(UD_DATA, got);
++				ud_rndis_command((const uint8_t *)(ud.dma + UD_DATA), got);
++				ud.encmd_len = 0;
++			}
+ 			ud.state = EP0_WAIT_STATUS3;
+ 			break;
+ 		case EP0_STATUS:
+@@ -1455,6 +1883,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	/*
++	 * PCLM10: present the RNDIS function instead of CDC-ECM (Windows has
++	 * no in-box ECM class driver; see ud_cfg_desc_rndis). Parsed here,
++	 * before anything can answer a SETUP packet, so descriptors, control
++	 * protocol and data framing all agree on one function.
++	 */
++	PE_parse_boot_argn("sweetusbrndis", &ud.rndis, sizeof(ud.rndis));
++	if (ud.rndis) {
++		printf("SWEET USB: rndis: presenting the RNDIS function\n");
++	}
+ 	/*
+ 	 * flame: DMA buffers at a fixed physical address below 4 GB (RAM XNU
+ 	 * does not manage; ABL's own USB buffers were at 0xfd34c000), mapped
