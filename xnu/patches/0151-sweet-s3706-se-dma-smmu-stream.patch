@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 14f8531..ba0c303 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -15,8 +15,11 @@
+  * in the vendor 5.4 and upstream qcom-geni-se.c) because PCLM10's
+  * firmware disabled this SE's FIFO interface (GENI_IF_DISABLE_RO bit 0;
+  * the round that probed through the FIFO timed out exactly as that
+- * declares, while bit 1 shows the DMA interface enabled); TLMM is
+- * reached through the south tile like
++ * declares, while bit 1 shows the DMA interface enabled). The SE DMA
++ * master (stream 0x7a3, the qupv3_2 GENI-SE bank per the base DT) gets
++ * a non-translating apps-SMMU context bank, the recipe sweet_usb.c
++ * proved for stream 0x140 on this device; TLMM is reached
++ * through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+  * Boot-args: s3706=1 enable (default off), s3706delay=N start after N s
+@@ -146,9 +149,25 @@ void sweet_s3706_init(void);
+ #define TP_DMA_RX         0x400u
+ #define TP_DMA_SIZE       0x1000u
+ 
++/*
++ * Apps SMMU (MMU-500) and the SE17 DMA master's stream. The base DT
++ * ties i2c@0xc80000 to the qupv3_2 wrapper core, whose GENI-SE context
++ * bank is iommus = <&apps_smmu 0x7a3 0x0> with qcom,iommu-s1-bypass:
++ * the vendor runs this bus's DMA stage-1-bypassed, on physical
++ * addresses. ABL removes its stream-match entry when it leaves
++ * fastboot, and the SMMU faults unmatched streams - sweet_usb.c
++ * documents the identical recipe and failure for stream 0x140 (un-
++ * matched stream, first DMA, global fault, SoC reset: what the round
++ * with dtx=0x4 showed). Give 0x7a3 its own non-translating context
++ * bank, exactly the recipe sweet_usb.c proved on this device.
++ */
++#define AS_PA           0x15000000ULL
++#define AS_SIZE         0x100000
++#define SE_SID          0x7a3u
++
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+-	vm_offset_t dma;
++	vm_offset_t dma, smmu, cb;
+ 	uint64_t dma_pa;
+ 	bool started, dead, probing;
+ 	int log;
+@@ -225,6 +244,87 @@ tp_dma_alloc(void)
+ 	return true;
+ }
+ 
++/*
++ * Give the SE17 DMA master (stream 0x7a3) a working stream match, the
++ * sweet_usb.c recipe: if ABL left a match whose bank does no trans-
++ * lation, physical addresses pass through and we use it as is; other-
++ * wise program the first free stream-match register to the first free
++ * bank, programmed non-translating exactly like ABL's own DMA banks
++ * (SCTLR M=0, CBA2R AArch64, CBAR 0x1f000; a bypass S2CR type is
++ * refused by hypervisor policy, so the bypass lives in the bank).
++ */
++static bool
++tp_smmu_setup(void)
++{
++	st.smmu = ml_io_map(AS_PA, AS_SIZE);
++	if (!st.smmu) {
++		printf("SWEET S3706: apps SMMU mapping failed; stopping\n");
++		return false;
++	}
++	uint32_t idr0 = tp_rd(st.smmu, 0x20), idr1 = tp_rd(st.smmu, 0x24);
++	unsigned nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	uint32_t pagesz = (idr1 >> 31) ? 0x10000u : 0x1000u;
++	uint32_t cbbase = (1u << (((idr1 >> 28) & 7u) + 1)) * pagesz;
++	uint64_t used[2] = {0, 0};
++	int free_smr = -1, cb = -1;
++	for (unsigned i = 0; i < nsmr; i++) {
++		uint32_t m = tp_rd(st.smmu, 0x800 + 4 * i);
++		uint32_t c = tp_rd(st.smmu, 0xc00 + 4 * i);
++		if (!(m >> 31)) {
++			if (free_smr < 0) {
++				free_smr = (int)i;
++			}
++			continue;
++		}
++		if (((c >> 16) & 3) == 0) {
++			used[(c & 0xff) / 64] |= 1ULL << ((c & 0xff) % 64);
++		}
++		if (((SE_SID ^ (m & 0x7fff)) & ~((m >> 16) & 0x7fff) & 0x7fff) == 0) {
++			unsigned cb0 = c & 0xff;
++			vm_offset_t cbv = st.smmu + cbbase + cb0 * pagesz;
++			if (((c >> 16) & 3) == 0 && !(tp_rd(cbv, 0) & 1)) {
++				st.cb = cbv;
++				printf("SWEET S3706: SMMU smr%u %x already matches %#x via cb%u "
++				    "(cbar %x sctlr %x: no translation, using it)\n",
++				    i, m, SE_SID, cb0,
++				    tp_rd(st.smmu, pagesz + 4 * cb0), tp_rd(cbv, 0));
++				return true;
++			}
++			printf("SWEET S3706: SMMU smr%u %x matches %#x via translating cb (s2cr %#x); stopping\n",
++			    i, m, SE_SID, c);
++			return false;
++		}
++	}
++	/* Lowest free bank, as Linux allocates: the top banks may be secure. */
++	for (int c = 0; c < (int)ncb; c++) {
++		if (!(used[c / 64] & (1ULL << (c % 64))) &&
++		    !(tp_rd(st.smmu, cbbase + (uint32_t)c * pagesz) & 1) &&
++		    tp_rd(st.smmu, pagesz + 4 * (uint32_t)c) == 0) {
++			cb = c;
++			break;
++		}
++	}
++	if (free_smr < 0 || cb < 0) {
++		printf("SWEET S3706: SMMU: no free smr/cb for stream %#x (smr %d cb %d); stopping\n",
++		    SE_SID, free_smr, cb);
++		return false;
++	}
++	vm_offset_t cbv = st.smmu + cbbase + (uint32_t)cb * pagesz;
++	tp_wr(st.smmu, cbv - st.smmu, 0xe0);                    /* SCTLR: M=0, like ABL */
++	tp_wr(st.smmu, pagesz + 0x800 + 4 * (uint32_t)cb, 1);  /* CBA2R: AArch64 */
++	tp_wr(st.smmu, pagesz + 4 * (uint32_t)cb, 0x1f000);    /* CBAR as ABL's banks */
++	tp_wr(st.smmu, 0xc00 + 4 * (uint32_t)free_smr, (uint32_t)cb);
++	tp_wr(st.smmu, 0x800 + 4 * (uint32_t)free_smr, (1u << 31) | SE_SID);
++	st.cb = cbv;
++	printf("SWEET S3706: SMMU smr%d %x s2cr %x -> cb%d cbar %x cba2r %x sctlr %x (no translation, as ABL)\n",
++	    free_smr, tp_rd(st.smmu, 0x800 + 4 * (uint32_t)free_smr),
++	    tp_rd(st.smmu, 0xc00 + 4 * (uint32_t)free_smr), cb,
++	    tp_rd(st.smmu, pagesz + 4 * (uint32_t)cb),
++	    tp_rd(st.smmu, pagesz + 0x800 + 4 * (uint32_t)cb),
++	    tp_rd(st.smmu, cbv - st.smmu));
++	return true;
++}
++
+ /* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
+ static void
+ tp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+@@ -398,7 +498,13 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 			st.dtx_last |= dstat;
+ 		}
+ 		if (dstat & DMA_AHB_ERR_EN) {
+-			err = EIO; /* the DMA master faulted (SMMU?) */
++			err = EIO; /* the DMA master faulted: name the SMMU side */
++			if (st.cb) {
++				printf("SWEET S3706: dma AHB_ERR: smmu cb fsr=%#x far=%08x:%08x fsynr0=%#x fsynr1=%#x\n",
++				    tp_rd(st.cb, 0x58), tp_rd(st.cb, 0x64),
++				    tp_rd(st.cb, 0x60), tp_rd(st.cb, 0x68),
++				    tp_rd(st.cb, 0x6c));
++			}
+ 			break;
+ 		}
+ 		if (irq & SE_ERRORS) {
+@@ -712,6 +818,9 @@ tp_thread(void *arg, wait_result_t result)
+ 	if (!tp_dma_alloc()) {
+ 		goto out;
+ 	}
++	if (!tp_smmu_setup()) {
++		goto out;
++	}
+ 	printf("SWEET S3706: TLMM cfg/io en=%#x/%#x reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_EN1V8)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_EN1V8)),
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_RESET)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_RESET)),
