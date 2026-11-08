@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 1ce865e..3e70258 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -383,10 +383,21 @@ tp_se_init(void)
+ 	uint32_t tx = tp_rd(st.se, SE_HW_TX), rx = tp_rd(st.se, SE_HW_RX);
+ 	printf("SWEET S3706: se17 fw=%#x proto=%u status=%#x tx=%#x rx=%#x hwid=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, tp_rd(st.se, SE_STATUS), tx, rx, tp_rd(st.se, 0x000));
++	/*
++	 * FIFO depth is a property of the SE, not of the bus: this SE17
++	 * reports a 4-word RX FIFO (0x20104900), flame's SE7 reported 32.
++	 * Linux's geni-i2c accepts whatever depth the SE reports and relies
++	 * on hardware flow control (clock stretching) while the FIFO drains;
++	 * tp_msg_run drains word by word, so a shallow RX FIFO is fine.
++	 * Keep the firmware-protocol and FIFO-mode gates and require only
++	 * that both FIFOs exist.
++	 */
+ 	if (((fw >> 8) & 0xffu) != 3u || (tp_rd(st.se, 0x64) & 1u) ||
+-	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) < 1u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("SWEET S3706: need ABL-loaded I2C firmware and 32-bit FIFOs; stopping\n");
++		printf("SWEET S3706: need ABL-loaded I2C firmware in FIFO mode; stopping (tx=%u/%u rx=%u/%u words)\n",
++		    (tx >> 24) & 0x3fu, (tx >> 16) & 0x3fu,
++		    (rx >> 24) & 0x3fu, (rx >> 16) & 0x3fu);
+ 		return false;
+ 	}
+ 	if (tp_rd(st.se, SE_STATUS) & 0x1001u) {
