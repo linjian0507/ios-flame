@@ -5,6 +5,15 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 0163: coarse framebuffer capture for rendering diagnosis (2026-11-09)
+
+- Touch and home-screen rendering are verified working. The user reports
+  some icons missing and software rendering abnormal; the lock screen is
+  iOS's default gradient poster.
+- 0163 adds `sweetfb_map=1`: at sample slots 3 and 4 it emits 48x106
+  RGB332 hex rows (`SWEET FB MAP`) from panel memory. Host
+  `scripts/decode_fb_map.py` reconstructs PNGs. Diagnostic only.
+
 ### PCLM10 0162: PM8150L GPIO5 enable write (2026-11-09)
 
 - Kernel 0161 boot (capture `work/usb-log-20261109-001018/`, image

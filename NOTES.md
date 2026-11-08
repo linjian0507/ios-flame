@@ -66,6 +66,9 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 ## Flame patches
 
+- PCLM10 fork 0163: coarse 48x106 RGB332 panel-map capture at sample
+  slots 3/4 (`sweetfb_map=1`), decoded to PNG on the host. Diagnostic
+  only, for the remaining missing-icon/software-render issue.
 - PCLM10 fork 0162: first touch 1.8 V write. A16 register read showed
   PM8150L GPIO5 owned by EE0, valid LV GPIO, but left input/pull-down.
   The patch writes only its register block after type/subtype/owner checks,

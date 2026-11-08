@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0162-flame-pclm10-pmic-enable-display-compare.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0163-flame-pclm10-framebuffer-map.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -129,6 +129,18 @@ int main(void) {
         self.assertEqual([setter.index(x) for x in order], sorted(setter.index(x) for x in order))
         self.assertIn("sweet_spmi_touch_gpio_set(true)", touch)
         self.assertIn("tp_pmic_gpio_diagnostic();", touch[touch.index("sweet_spmi_touch_gpio_set(true)"):])
+
+    def test_framebuffer_map_capture_is_bounded(self):
+        src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        fn = extract_function(src, "sweet_fb_dump_map")
+        self.assertIn("48x106", src)
+        self.assertIn("SWEET FB MAP %u %u %s", fn)
+        self.assertIn("p[2] & 0xe0u", fn)
+        self.assertIn("gy < 106", fn)
+        self.assertIn("gx < 48", fn)
+        self.assertIn("PE_parse_boot_argn(\"sweetfb_map\"", fn)
+        self.assertIn("if (slot >= 3)", src)
+        self.assertNotIn("SWEET FB MAP", src[:src.index(fn)])
 
     def test_touch_gpio_register_values(self):
         src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
@@ -280,8 +292,9 @@ int main() {
         spec = importlib.util.spec_from_file_location("isolation", ROOT / "scripts/test_pclm10_driver_isolation.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.assertEqual(module.args("unixnu-p4-touch-pmicdiag.toml"),
-                         module.args("unixnu-p4-touch.toml") + ["sweetfb_compare=1"])
+        self.assertEqual(sorted(set(module.args("unixnu-p4-touch-pmicdiag.toml")) -
+                                set(module.args("unixnu-p4-touch.toml"))),
+                         ["sweetfb_compare=1", "sweetfb_map=1"])
 
     @unittest.skipIf(SOURCE_FLAG, "requires the board's DT and on-device log")
     def test_identifies_cpu_center_crop_without_claiming_correct_output(self):
@@ -301,10 +314,10 @@ int main() {
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0161-r42496120098/xnu/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0161-r42496120098/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0161-r42496120098/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0161-r42496120098/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0162-r42499489651/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0162-r42499489651/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0162-r42499489651/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0162-r42499489651/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:
