@@ -66,6 +66,10 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 ## Flame patches
 
+- PCLM10 fork 0168: alternate synthetic unlock/page swipes for
+  unattended home-screen capture. 0167: opt-in swipe automation.
+- PCLM10 fork 0166: time-triggered panel maps. 0167/0168 screenshots
+  show installed apps render correctly; root image lacks most stock apps.
 - PCLM10 fork 0164: panel-map capture now averages 48x106 blocks (point
   sampling hid small icons) and adds a 240-present frame. Diagnostic only.
 - PCLM10 fork 0163: coarse 48x106 RGB332 panel-map capture at sample

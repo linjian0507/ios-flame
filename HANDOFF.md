@@ -5,6 +5,25 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 0167/0168: unattended screenshots; installed apps render, image is system-only (2026-11-09)
+
+- 0167 adds opt-in synthetic swipes (`s3706swipe=N`): first swipe
+  unlocks, later swipes turn pages. 0168 alternates unlock and page turns.
+  0166 maps are time-based (75/150/210 s) and block-averaged; host
+  `tools/decode-fb-map.py` turns them into PNGs.
+- Captured home page: Camera, Photos, App Store, Settings, Phone,
+  Messages and Safari render correctly; other grid positions are empty.
+- Root image audit: `/Applications` contains only system apps/services.
+  Mail, Clock, Maps, Calendar, Notes, Reminders, Music, TV, Podcasts,
+  Books, Health, Wallet, Files, Weather, Stocks, Calculator, Compass,
+  Voice Memos, Contacts and Shortcuts are absent. The blank positions
+  are missing apps, not failed rendering.
+- `sweetsurf10=2` A/B changed only 4 map cells; wide-color surfaces are
+  not the cause.
+- Lock screen blue/red is the default Collections gradient poster.
+- Kernel rendering, colour order and touch are verified; remaining items
+  are content/provisioning.
+
 ### PCLM10 0164: averaged panel map (2026-11-09)
 
 - 0163's point-sampled map hid small icon art. 0164 averages each block
