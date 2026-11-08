@@ -1,0 +1,214 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index e726134..39a0c5a 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -18,9 +18,10 @@
+  * declares, while bit 1 shows the DMA interface enabled). The SE DMA
+  * master (stream 0x7a3, the qupv3_2 GENI-SE bank per the base DT) gets
+  * a non-translating apps-SMMU context bank, the recipe sweet_usb.c
+- * proved for stream 0x140 on this device, and the TBU on its path is
+- * checked against the base DT's own power/halt description (GDSC
+- * power-on, debug-halt clear, idle status) before any request; TLMM is
++ * proved for stream 0x140 on this device; the TBU on its path is
++ * checked against the base DT's own power/halt description, reset
++ * through its GDSC, and any transaction its bank is stalled on is
++ * dropped with the vendor's RESUME_TERMINATE before probing; TLMM is
+  * reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+@@ -178,6 +179,18 @@ void sweet_s3706_init(void);
+  * poll PWR_ON bit 31; arm-smmu.c tbu_resume: clear the halt bit).
+  * (qcom,actlr turned out to be an SMR-match table - id, mask, value -
+  * and no entry matches 0x7a3, so it plays no part here.)
++ *
++ * The round after that answered the checks: the domain is on (both
++ * TBUs read PWR_ON, no collapse), no vendor-defined halt is set, and
++ * the TBU reports idle - yet the request still went unanswered, and
++ * the bank's fault record showed a stale FSR identical to the one on
++ * USB's working bank. The dump also read ARM's standard global-fault
++ * offsets, which this vendor layout does not have (the real ones are
++ * sGFSR at 0x48 and CBFRSYNRA at GR1 + 0x400, naming the SID that
++ * last faulted on a bank). So: clear the stale fault state, drop any
++ * transaction the bank is stalled on with the vendor's own
++ * RESUME_TERMINATE (CB + 8), reset the TBU through its GDSC, and let
++ * the corrected dump name the truth.
+  */
+ #define AS_PA           0x15000000ULL
+ #define AS_SIZE         0x100000
+@@ -193,10 +206,34 @@ void sweet_s3706_init(void);
+ #define GDSC_PWR_ON     (1u << 31)
+ #define GDSC_HW_CONTROL (1u << 1)
+ #define GDSC_SW_COLLAPSE (1u << 0)
++/*
++ * This vendor's global register layout (arm-smmu-regs.h of the tree
++ * SM8150 runs, offsets from the SMMU base): sCR0 at 0 (fault routing:
++ * GFRE/GFIE/USFCFG bits decide who reports), sGFSR at 0x48 (global
++ * fault status, write-1-to-clear), sGFSYNR0..2 at 0x50..0x58 (the
++ * faulting stream and attributes), and CBFRSYNRA per bank at
++ * GR1 + 0x400 (GR1 = pagesz above the base): the low 16 bits name
++ * the SID that last faulted on that bank. ARM's standard GBFR/GBPA
++ * offsets do not exist here - reading them says nothing.
++ */
++#define AS_SCR0         0x000u
++#define AS_GFSR         0x048u
++#define AS_GFSYNR0      0x050u
++#define AS_GFSYNR1      0x054u
++#define AS_GFSYNR2      0x058u
++#define AS_CBFRSYNRA    0x400u  /* plus 4 * bank, on top of GR1 */
++/* CB RESUME at +0x8: writing bit 0 (TERMINATE) drops the transaction
++ * a stalled bank is holding - the vendor fault/tbu-halt paths' own
++ * recovery. FSR at +0x58 is write-1-to-clear. */
++#define CB_RESUME       0x08u
++#define CB_RESUME_TERM  (1u << 0)
++#define CB_FSR          0x58u
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	vm_offset_t dma, smmu, cb, tbu, tbu_status, gdsc;
++	int cbndx;
++	uint32_t pagesz;
+ 	uint64_t dma_pa;
+ 	bool started, dead, probing;
+ 	int log;
+@@ -313,6 +350,8 @@ tp_smmu_setup(void)
+ 			vm_offset_t cbv = st.smmu + cbbase + cb0 * pagesz;
+ 			if (((c >> 16) & 3) == 0 && !(tp_rd(cbv, 0) & 1)) {
+ 				st.cb = cbv;
++				st.cbndx = (int)cb0;
++				st.pagesz = pagesz;
+ 				printf("SWEET S3706: SMMU smr%u %x already matches %#x via cb%u "
+ 				    "(cbar %x sctlr %x: no translation, using it)\n",
+ 				    i, m, SE_SID, cb0,
+@@ -345,6 +384,8 @@ tp_smmu_setup(void)
+ 	tp_wr(st.smmu, 0xc00 + 4 * (uint32_t)free_smr, (uint32_t)cb);
+ 	tp_wr(st.smmu, 0x800 + 4 * (uint32_t)free_smr, (1u << 31) | SE_SID);
+ 	st.cb = cbv;
++	st.cbndx = cb;
++	st.pagesz = pagesz;
+ 	printf("SWEET S3706: SMMU smr%d %x s2cr %x -> cb%d cbar %x cba2r %x sctlr %x (no translation, as ABL)\n",
+ 	    free_smr, tp_rd(st.smmu, 0x800 + 4 * (uint32_t)free_smr),
+ 	    tp_rd(st.smmu, 0xc00 + 4 * (uint32_t)free_smr), cb,
+@@ -412,12 +453,14 @@ tp_tbu_health(void)
+ }
+ 
+ /*
+- * A request timed out: let the SMMU say where it is stuck. The global
+- * fault registers (GBADDR/GBFWR/GBFR, sGBPA(FTR), nsGBPA(FTR)) name
+- * an unmatched stream or a global abort; the context bank's
+- * fsr/far/fsynr name a context fault; and a TBU status mirror that
+- * reads anything but 1 after the request means the TBU is stuck on
+- * it. All read-only, and the same evidence after an AHB_ERR.
++ * A request timed out: let the SMMU say where it is stuck. In this
++ * vendor's layout sGFSR/sGFSYNR (0x48/0x50..0x58) name a global
++ * fault and its stream, sCR0 (0) shows who was supposed to report
++ * it, and CBFRSYNRA names the SID that last faulted on our bank -
++ * 0x7a3 there means our request faulted. The context bank's
++ * fsr/far/fsynr name a context fault; a TBU status mirror reading
++ * anything but 1 after the request means the TBU is stuck on it.
++ * All read-only, and the same evidence after an AHB_ERR.
+  */
+ static void
+ tp_smmu_dump(const char *why)
+@@ -425,11 +468,17 @@ tp_smmu_dump(const char *why)
+ 	if (!st.smmu) {
+ 		return;
+ 	}
+-	printf("SWEET S3706: %s: smmu gbaddr %08x:%08x gbfwr %#x gbfr %#x "
+-	    "sgbpa %#x/%#x nsgbpa %#x/%#x\n", why,
+-	    tp_rd(st.smmu, 0x604), tp_rd(st.smmu, 0x600), tp_rd(st.smmu, 0x608),
+-	    tp_rd(st.smmu, 0x60c), tp_rd(st.smmu, 0x680), tp_rd(st.smmu, 0x688),
+-	    tp_rd(st.smmu, 0x6c0), tp_rd(st.smmu, 0x6c8));
++	printf("SWEET S3706: %s: smmu scr0=%#x gfsr=%#x gfsynr0=%#x "
++	    "gfsynr1=%#x gfsynr2=%#x\n", why,
++	    tp_rd(st.smmu, AS_SCR0), tp_rd(st.smmu, AS_GFSR),
++	    tp_rd(st.smmu, AS_GFSYNR0), tp_rd(st.smmu, AS_GFSYNR1),
++	    tp_rd(st.smmu, AS_GFSYNR2));
++	if (st.cbndx >= 0) {
++		printf("SWEET S3706: %s: cb%d frsynra=%#x (faulting SID is low 16 bits)\n",
++		    why, st.cbndx,
++		    tp_rd(st.smmu, st.pagesz + AS_CBFRSYNRA +
++		    4 * (uint32_t)st.cbndx));
++	}
+ 	if (st.cb) {
+ 		printf("SWEET S3706: %s: cb fsr=%#x far=%08x:%08x fsynr0=%#x fsynr1=%#x\n",
+ 		    why, tp_rd(st.cb, 0x58), tp_rd(st.cb, 0x64), tp_rd(st.cb, 0x60),
+@@ -443,6 +492,70 @@ tp_smmu_dump(const char *why)
+ 	}
+ }
+ 
++/*
++ * Clear the stale fault state before the first request. In the last
++ * round our bank's fault record carried the same FSR value as USB's
++ * working bank - both predate this driver - and a context fault that
++ * was never reported and resumed leaves the bank stalled on its
++ * transaction: the vendor driver's own recovery for that is writing
++ * RESUME_TERMINATE to CB + 8 (arm-smmu.c fault and tbu-halt paths).
++ * Clear the global fault status too (write-1-to-clear), so what the
++ * timeout dump prints afterwards can only be this round's request.
++ */
++static void
++tp_smmu_reset_stale(void)
++{
++	if (!st.smmu || st.cbndx < 0) {
++		return;
++	}
++	uint32_t gfsr = tp_rd(st.smmu, AS_GFSR);
++	if (gfsr) {
++		tp_wr(st.smmu, AS_GFSR, gfsr);
++	}
++	uint32_t fsr = tp_rd(st.cb, CB_FSR);
++	if (fsr) {
++		tp_wr(st.cb, CB_FSR, fsr);
++	}
++	tp_wr(st.cb, CB_RESUME, CB_RESUME_TERM);
++	printf("SWEET S3706: cleared stale state: gfsr=%#x cb%d fsr=%#x, resume=terminate\n",
++	    gfsr, st.cbndx, fsr);
++}
++
++/*
++ * Reset the TBU itself through its power domain - the same GDSC the
++ * vendor iommu regulator driver enables and disables the TBU with.
++ * The base DT blesses the disable with qcom,no-status-check-on-
++ * disable: a domain holding an outstanding request may never report
++ * OFF, so do not wait on it; the enable half is gdsc.c's recipe
++ * (de-assert collapse, poll power-on). If the domain does drop,
++ * this is a full reset of the TBU's internal state.
++ */
++static void
++tp_tbu_power_cycle(void)
++{
++	if (!st.gdsc) {
++		return;
++	}
++	uint32_t g2 = tp_rd(st.gdsc, GDSC_TBU2_OFF);
++	if (!(g2 & GDSC_PWR_ON)) {
++		return; /* tp_tbu_health already turned the domain on */
++	}
++	tp_wr(st.gdsc, GDSC_TBU2_OFF, g2 | GDSC_SW_COLLAPSE);
++	for (unsigned i = 0; i < 100 &&
++	    (tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON); ++i) {
++		delay(1000);
++	}
++	bool off = !(tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON);
++	tp_wr(st.gdsc, GDSC_TBU2_OFF, g2 & ~(GDSC_HW_CONTROL | GDSC_SW_COLLAPSE));
++	for (unsigned i = 0; i < 1000 &&
++	    !(tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON); ++i) {
++		delay(1000);
++	}
++	printf("SWEET S3706: tbu2 power cycle: collapsed=%d, now %#x (on=%u)\n",
++	    off ? 1 : 0, tp_rd(st.gdsc, GDSC_TBU2_OFF),
++	    (tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON) ? 1u : 0u);
++}
++
+ /* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
+ static void
+ tp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+@@ -940,6 +1053,8 @@ tp_thread(void *arg, wait_result_t result)
+ 	if (!tp_smmu_setup()) {
+ 		goto out;
+ 	}
++	tp_smmu_reset_stale(); /* a stale fault record stalls the bank */
++	tp_tbu_power_cycle();  /* the domain is the vendor's TBU reset */
+ 	printf("SWEET S3706: TLMM cfg/io en=%#x/%#x reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_EN1V8)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_EN1V8)),
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_RESET)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_RESET)),
