@@ -1,0 +1,199 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index ba0c303..e726134 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -18,8 +18,10 @@
+  * declares, while bit 1 shows the DMA interface enabled). The SE DMA
+  * master (stream 0x7a3, the qupv3_2 GENI-SE bank per the base DT) gets
+  * a non-translating apps-SMMU context bank, the recipe sweet_usb.c
+- * proved for stream 0x140 on this device; TLMM is reached
+- * through the south tile like
++ * proved for stream 0x140 on this device, and the TBU on its path is
++ * checked against the base DT's own power/halt description (GDSC
++ * power-on, debug-halt clear, idle status) before any request; TLMM is
++ * reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+  * Boot-args: s3706=1 enable (default off), s3706delay=N start after N s
+@@ -160,14 +162,41 @@ void sweet_s3706_init(void);
+  * matched stream, first DMA, global fault, SoC reset: what the round
+  * with dtx=0x4 showed). Give 0x7a3 its own non-translating context
+  * bank, exactly the recipe sweet_usb.c proved on this device.
++ *
++ * The round after that: the match took (no global fault, no reset)
++ * but the request went unanswered - no DMA error, no M event. The
++ * base DT names what else gates this stream's path. The TBU serving
++ * 0x7a3 is anoc_2 (stream range 0x400-0x800): its power domain is
++ * qcom,gdsc@0x17d048 (hlos1_vote_aggre_noc_mmu_tbu2_gdsc), which
++ * only the vendor iommu driver's regulator ever enables - nothing ran
++ * that here - and its debug-halt register (TBU base + 0, bit 16;
++ * halt-ack + 0x20 bit 1) plus an idle status mirror at the DT's
++ * status-reg (0x15182208, idle reads 1) are the vendor ECATS knobs.
++ * A halted or unpowered TBU accepts requests and never forwards them:
++ * exactly this silence. Check all three, and undo halt/collapse with
++ * the vendor drivers' own recipes (gdsc.c: clear SW_COLLAPSE bit 0,
++ * poll PWR_ON bit 31; arm-smmu.c tbu_resume: clear the halt bit).
++ * (qcom,actlr turned out to be an SMR-match table - id, mask, value -
++ * and no entry matches 0x7a3, so it plays no part here.)
+  */
+ #define AS_PA           0x15000000ULL
+ #define AS_SIZE         0x100000
+ #define SE_SID          0x7a3u
++#define TBU2_PA         0x15189000ULL     /* anoc_2 TBU (streams 0x400-0x800) */
++#define TBU_STATUS_PA   0x15182208ULL     /* its status-reg mirror, base DT */
++#define TBU_HALT_REG    0x000u            /* DEBUG_SID_HALT_REG, bit 16 halt */
++#define TBU_HALT_VAL    (1u << 16)
++#define TBU_HALT_ACK    0x020u            /* DEBUG_SR_HALT_ACK_REG, bit 1 ack */
++#define GDSC_PAGE_PA    0x0017d000ULL     /* GCC GDSC registers (base DT) */
++#define GDSC_TBU1_OFF   0x044u            /* tbu1 domain: anoc_1, proven (USB) */
++#define GDSC_TBU2_OFF   0x048u            /* tbu2 domain: anoc_2, ours */
++#define GDSC_PWR_ON     (1u << 31)
++#define GDSC_HW_CONTROL (1u << 1)
++#define GDSC_SW_COLLAPSE (1u << 0)
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+-	vm_offset_t dma, smmu, cb;
++	vm_offset_t dma, smmu, cb, tbu, tbu_status, gdsc;
+ 	uint64_t dma_pa;
+ 	bool started, dead, probing;
+ 	int log;
+@@ -325,6 +354,95 @@ tp_smmu_setup(void)
+ 	return true;
+ }
+ 
++/*
++ * The TBU that serves stream 0x7a3 must be powered and free of a
++ * debug halt to forward requests. The base DT names its power domain
++ * (qcom,gdsc@0x17d048, the domain only the vendor iommu regulator
++ * driver ever enables - nothing ran that here) and its ECATS debug
++ * halt register; the recipes are gdsc.c's (de-assert SW_COLLAPSE bit
++ * 0, poll PWR_ON bit 31) and the vendor arm-smmu.c tbu_resume (clear
++ * the halt request bit), both for this SoC generation. The proven
++ * TBU (anoc_1, carrying USB's 0x140) is read as the reference. This
++ * never fails the probe: its writes are the vendor's own recovery
++ * steps, and its prints are the evidence.
++ */
++static void
++tp_tbu_health(void)
++{
++	st.gdsc = ml_io_map(GDSC_PAGE_PA, 0x1000);
++	st.tbu = ml_io_map(TBU2_PA, 0x1000);
++	st.tbu_status = ml_io_map(TBU_STATUS_PA & ~0xfffULL, 0x1000);
++	if (!st.gdsc || !st.tbu || !st.tbu_status) {
++		printf("SWEET S3706: tbu/gdsc mapping failed gdsc=%#lx tbu=%#lx st=%#lx\n",
++		    (unsigned long)st.gdsc, (unsigned long)st.tbu,
++		    (unsigned long)st.tbu_status);
++		return;
++	}
++	uint32_t g1 = tp_rd(st.gdsc, GDSC_TBU1_OFF), g2 = tp_rd(st.gdsc, GDSC_TBU2_OFF);
++	printf("SWEET S3706: gdsc tbu1=%#x (on=%u) tbu2=%#x (on=%u hw=%u collapse=%u); "
++	    "tbu2 halt=%#x ack=%#x status=%#x (idle status is 1)\n",
++	    g1, (g1 & GDSC_PWR_ON) ? 1u : 0u, g2,
++	    (g2 & GDSC_PWR_ON) ? 1u : 0u, (g2 & GDSC_HW_CONTROL) ? 1u : 0u,
++	    (g2 & GDSC_SW_COLLAPSE) ? 1u : 0u,
++	    tp_rd(st.tbu, TBU_HALT_REG), tp_rd(st.tbu, TBU_HALT_ACK),
++	    tp_rd(st.tbu_status, (uint32_t)(TBU_STATUS_PA & 0xfff)));
++	/* Vendor arm-smmu.c tbu_resume: clear the debug halt request. */
++	uint32_t halt = tp_rd(st.tbu, TBU_HALT_REG);
++	if (halt & TBU_HALT_VAL) {
++		tp_wr(st.tbu, TBU_HALT_REG, halt & ~TBU_HALT_VAL);
++		printf("SWEET S3706: tbu2 was debug-halted; cleared, now halt=%#x ack=%#x\n",
++		    tp_rd(st.tbu, TBU_HALT_REG), tp_rd(st.tbu, TBU_HALT_ACK));
++	}
++	/* Vendor gdsc.c enable: de-assert software collapse, poll power-
++	 * on. gdsc-regulator.c refuses to touch a domain under hardware
++	 * control, but an hw-controlled domain reading as off here has
++	 * no voter (no RPMh path ran), so taking software control is the
++	 * only way to name it; log the difference. */
++	if (!(g2 & GDSC_PWR_ON)) {
++		tp_wr(st.gdsc, GDSC_TBU2_OFF,
++		    g2 & ~(GDSC_HW_CONTROL | GDSC_SW_COLLAPSE));
++		for (unsigned i = 0; i < 1000 &&
++		    !(tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON); ++i) {
++			delay(1);
++		}
++		printf("SWEET S3706: gdsc tbu2 was off; de-collapsed, now %#x (on=%u)\n",
++		    tp_rd(st.gdsc, GDSC_TBU2_OFF),
++		    (tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON) ? 1u : 0u);
++	}
++}
++
++/*
++ * A request timed out: let the SMMU say where it is stuck. The global
++ * fault registers (GBADDR/GBFWR/GBFR, sGBPA(FTR), nsGBPA(FTR)) name
++ * an unmatched stream or a global abort; the context bank's
++ * fsr/far/fsynr name a context fault; and a TBU status mirror that
++ * reads anything but 1 after the request means the TBU is stuck on
++ * it. All read-only, and the same evidence after an AHB_ERR.
++ */
++static void
++tp_smmu_dump(const char *why)
++{
++	if (!st.smmu) {
++		return;
++	}
++	printf("SWEET S3706: %s: smmu gbaddr %08x:%08x gbfwr %#x gbfr %#x "
++	    "sgbpa %#x/%#x nsgbpa %#x/%#x\n", why,
++	    tp_rd(st.smmu, 0x604), tp_rd(st.smmu, 0x600), tp_rd(st.smmu, 0x608),
++	    tp_rd(st.smmu, 0x60c), tp_rd(st.smmu, 0x680), tp_rd(st.smmu, 0x688),
++	    tp_rd(st.smmu, 0x6c0), tp_rd(st.smmu, 0x6c8));
++	if (st.cb) {
++		printf("SWEET S3706: %s: cb fsr=%#x far=%08x:%08x fsynr0=%#x fsynr1=%#x\n",
++		    why, tp_rd(st.cb, 0x58), tp_rd(st.cb, 0x64), tp_rd(st.cb, 0x60),
++		    tp_rd(st.cb, 0x68), tp_rd(st.cb, 0x6c));
++	}
++	if (st.tbu && st.tbu_status && st.gdsc) {
++		printf("SWEET S3706: %s: tbu2 halt=%#x ack=%#x status=%#x gdsc2=%#x\n",
++		    why, tp_rd(st.tbu, TBU_HALT_REG), tp_rd(st.tbu, TBU_HALT_ACK),
++		    tp_rd(st.tbu_status, (uint32_t)(TBU_STATUS_PA & 0xfff)),
++		    tp_rd(st.gdsc, GDSC_TBU2_OFF));
++	}
++}
++
+ /* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
+ static void
+ tp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+@@ -474,7 +592,9 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 		tp_wr(st.se, SE_DRX_IRQ_EN_SET, en);
+ 		tp_wr(st.se, SE_DRX_PTR_L, (uint32_t)pa);
+ 		tp_wr(st.se, SE_DRX_PTR_H, (uint32_t)(pa >> 32));
+-		tp_wr(st.se, SE_DRX_ATTR, DMA_EOT_BUF);
++		/* Vendor geni_se_rx_dma_prep: "RX does not have EOT
++		 * buffer type bit. So just reset RX_ATTR". */
++		tp_wr(st.se, SE_DRX_ATTR, 0);
+ 		tp_wr(st.se, SE_DRX_LEN, nr);
+ 		tp_wr(st.se, SE_RX_LEN, nr);
+ 	} else {
+@@ -499,12 +619,7 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 		}
+ 		if (dstat & DMA_AHB_ERR_EN) {
+ 			err = EIO; /* the DMA master faulted: name the SMMU side */
+-			if (st.cb) {
+-				printf("SWEET S3706: dma AHB_ERR: smmu cb fsr=%#x far=%08x:%08x fsynr0=%#x fsynr1=%#x\n",
+-				    tp_rd(st.cb, 0x58), tp_rd(st.cb, 0x64),
+-				    tp_rd(st.cb, 0x60), tp_rd(st.cb, 0x68),
+-				    tp_rd(st.cb, 0x6c));
+-			}
++			tp_smmu_dump("dma AHB_ERR");
+ 			break;
+ 		}
+ 		if (irq & SE_ERRORS) {
+@@ -541,6 +656,9 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 		}
+ 		delay(1);
+ 	}
++	if (err == ETIMEDOUT) {
++		tp_smmu_dump("xfer timeout");
++	}
+ 	tp_abort();
+ 	return err;
+ }
+@@ -818,6 +936,7 @@ tp_thread(void *arg, wait_result_t result)
+ 	if (!tp_dma_alloc()) {
+ 		goto out;
+ 	}
++	tp_tbu_health(); /* power and halt state of the TBU on our path */
+ 	if (!tp_smmu_setup()) {
+ 		goto out;
+ 	}
