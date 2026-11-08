@@ -5,6 +5,13 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 0164: averaged panel map (2026-11-09)
+
+- 0163's point-sampled map hid small icon art. 0164 averages each block
+  and adds a 240-present frame. Diagnostic only.
+- Surf10 A/B (`sweetsurf10=2`) was scheduled to test whether SpringBoard's
+  wide-color `w30r` icon surfaces explain missing icons.
+
 ### PCLM10 0163: coarse framebuffer capture for rendering diagnosis (2026-11-09)
 
 - Touch and home-screen rendering are verified working. The user reports

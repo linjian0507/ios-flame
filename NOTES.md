@@ -66,6 +66,8 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 ## Flame patches
 
+- PCLM10 fork 0164: panel-map capture now averages 48x106 blocks (point
+  sampling hid small icons) and adds a 240-present frame. Diagnostic only.
 - PCLM10 fork 0163: coarse 48x106 RGB332 panel-map capture at sample
   slots 3/4 (`sweetfb_map=1`), decoded to PNG on the host. Diagnostic
   only, for the remaining missing-icon/software-render issue.
