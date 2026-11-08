@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 6684358..b1c3334 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -21,8 +21,9 @@
+  * proved for stream 0x140 on this device; the TBU on its path is
+  * checked against the base DT's own power/halt description, reset
+  * through its GDSC, its bank's stale state dropped with the vendor's
+- * RESUME_TERMINATE, and its NoC path raised through RPMh with the
+- * base DT's own bus vectors - the vendor TBU driver's full recipe;
++ * RESUME_TERMINATE, its exact QUPv3_2-to-DDR NoC path raised through
++ * RPMh, and the SMMU's global TLB invalidated/synchronized before
++ * publishing the stream match - the proven GPU driver's sequence;
+  * TLMM is reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+@@ -204,7 +205,13 @@ void sweet_s3706_init(void);
+  * else does). The next round printed the firmware's cmd-db: QUP0 is
+  * present, and the SM8150 interconnect graph places qhm_qup2 under
+  * it, followed by SN11, SN0, SH0 and MC0 on the exact path to DDR.
+- * Raise that chain with the same RPMh recipe.
++ * Raise that chain with the same RPMh recipe. The next round proved
++ * every vote completed and the request remained faultlessly silent,
++ * ruling the NoC out. The one concrete programming difference left
++ * is that sweet_a6xx.c globally invalidates and synchronizes the SMMU
++ * TLB after configuring a bank and before publishing its stream map;
++ * this driver never did, so anoc_2 may retain ABL's old unmatched
++ * result for 0x7a3 even though SMR/S2CR read back correctly.
+  */
+ #define AS_PA           0x15000000ULL
+ #define AS_SIZE         0x100000
+@@ -235,6 +242,10 @@ void sweet_s3706_init(void);
+ #define AS_GFSYNR0      0x050u
+ #define AS_GFSYNR1      0x054u
+ #define AS_GFSYNR2      0x058u
++#define AS_TLBIALLNSNH  0x068u
++#define AS_TLBGSYNC     0x070u
++#define AS_TLBGSTATUS   0x074u
++#define AS_TLBG_ACTIVE  (1u << 0)
+ #define AS_CBFRSYNRA    0x400u  /* plus 4 * bank, on top of GR1 */
+ /* CB RESUME at +0x8: writing bit 0 (TERMINATE) drops the transaction
+  * a stalled bank is holding - the vendor fault/tbu-halt paths' own
+@@ -395,6 +406,25 @@ tp_smmu_setup(void)
+ 	tp_wr(st.smmu, cbv - st.smmu, 0xe0);                    /* SCTLR: M=0, like ABL */
+ 	tp_wr(st.smmu, pagesz + 0x800 + 4 * (uint32_t)cb, 1);  /* CBA2R: AArch64 */
+ 	tp_wr(st.smmu, pagesz + 4 * (uint32_t)cb, 0x1f000);    /* CBAR as ABL's banks */
++	/*
++	 * sweet_a6xx.c's proven SM8150 sequence: after programming the
++	 * context bank but before publishing S2CR/SMR, invalidate every
++	 * non-secure/non-hyp TLB entry and globally synchronize it. ABL
++	 * removed 0x7a3's match on exit; without this pulse an anoc_2 TBU
++	 * may retain that old unmatched/FAULT result even though the new
++	 * registers read back correctly - exactly the faultless silence
++	 * the last rounds measured.
++	 */
++	tp_wr(st.smmu, AS_TLBIALLNSNH, 0);
++	tp_wr(st.smmu, AS_TLBGSYNC, 0);
++	unsigned sync_ms = 0;
++	while ((tp_rd(st.smmu, AS_TLBGSTATUS) & AS_TLBG_ACTIVE) &&
++	    sync_ms < 10) {
++		delay(1000);
++		sync_ms++;
++	}
++	printf("SWEET S3706: SMMU global TLB invalidate/sync: status=%#x after %u ms\n",
++	    tp_rd(st.smmu, AS_TLBGSTATUS), sync_ms);
+ 	tp_wr(st.smmu, 0xc00 + 4 * (uint32_t)free_smr, (uint32_t)cb);
+ 	tp_wr(st.smmu, 0x800 + 4 * (uint32_t)free_smr, (1u << 31) | SE_SID);
+ 	st.cb = cbv;
