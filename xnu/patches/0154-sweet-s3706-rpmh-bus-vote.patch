@@ -1,0 +1,161 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 3a549a3..38a9b01 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -250,6 +250,53 @@ sweet_rpmh_dump_vrm(void)
+ 	}
+ }
+ 
++/*
++ * Same dump for every table the lookup path accepts - VRM, ARC and BCM
++ * - so a path whose voter name is not known here can be named from
++ * the firmware's own resource list instead of guessed. Read-only,
++ * bounded, called once from the PCLM10 S3706 bring-up before its
++ * first bus vote.
++ */
++void sweet_rpmh_dump_db(void);
++
++void
++sweet_rpmh_dump_db(void)
++{
++	if (rh_map() != 0) {
++		printf("SWEET RPMH: db dump: cmd-db not mapped\n");
++		return;
++	}
++	printf("SWEET RPMH: cmd-db dump: all resource keys\n");
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		if (slave != RH_VRM && slave != RH_ARC && slave != RH_BCM) {
++			continue;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if (!rh_range(entries, count * RH_DB_ENTRY)) {
++			printf("SWEET RPMH: db dump: malformed table %u\n", i);
++			return;
++		}
++		const char *kind = slave == RH_VRM ? "vrm" :
++		    (slave == RH_ARC ? "arc" : "bcm");
++		for (unsigned j = 0; j < count && j < 64; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			char name[9] = { 0 };
++			for (unsigned k = 0; k < 8; ++k) {
++				uint8_t ch = (uint8_t)(rh_read(rh_db, e + (k / 4) * 4) >> (8u * (k % 4)));
++				name[k] = (ch == ' ') ? '_' : ((ch >= 0x21 && ch < 0x7f) ? (char)ch : '.');
++			}
++			printf("SWEET RPMH: %s[%u] %s addr=%#x\n", kind, j, name,
++			    rh_read(rh_db, e + 16));
++		}
++	}
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 39a0c5a..61b2f7a 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -20,9 +20,10 @@
+  * a non-translating apps-SMMU context bank, the recipe sweet_usb.c
+  * proved for stream 0x140 on this device; the TBU on its path is
+  * checked against the base DT's own power/halt description, reset
+- * through its GDSC, and any transaction its bank is stalled on is
+- * dropped with the vendor's RESUME_TERMINATE before probing; TLMM is
+- * reached through the south tile like
++ * through its GDSC, its bank's stale state dropped with the vendor's
++ * RESUME_TERMINATE, and its NoC path raised through RPMh with the
++ * base DT's own bus vectors - the vendor TBU driver's full recipe;
++ * TLMM is reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+  * Boot-args: s3706=1 enable (default off), s3706delay=N start after N s
+@@ -48,6 +49,11 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++/* as sweet_gpu.c's gpu_bus_vote: the RPMh BCM writer (sweet_rpmh.c) */
++extern int sweet_rpmh_write(const char *res, unsigned n,
++    const uint32_t *offsets, const uint32_t *values);
++/* cmd-db resource table dump (sweet_rpmh.c debug aid) */
++extern void sweet_rpmh_dump_db(void);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_s3706_init(void);
+ 
+@@ -182,15 +188,20 @@ void sweet_s3706_init(void);
+  *
+  * The round after that answered the checks: the domain is on (both
+  * TBUs read PWR_ON, no collapse), no vendor-defined halt is set, and
+- * the TBU reports idle - yet the request still went unanswered, and
+- * the bank's fault record showed a stale FSR identical to the one on
+- * USB's working bank. The dump also read ARM's standard global-fault
+- * offsets, which this vendor layout does not have (the real ones are
+- * sGFSR at 0x48 and CBFRSYNRA at GR1 + 0x400, naming the SID that
+- * last faulted on a bank). So: clear the stale fault state, drop any
+- * transaction the bank is stalled on with the vendor's own
+- * RESUME_TERMINATE (CB + 8), reset the TBU through its GDSC, and let
+- * the corrected dump name the truth.
++ * the TBU's ECATS unit reports idle - yet the request still went
++ * unanswered. The corrected dump then named the truth: no global
++ * fault (sGFSR 0), and the bank's fault record belongs to another
++ * stream entirely (CBFRSYNRA names 0x69b6, a master from before this
++ * boot - our 0x7a3 never faulted at all). So the request is matched,
++ * translated, and dropped without a trace: the one gate the vendor
++ * TBU driver names that nothing on this boot has ever run is its
++ * NoC vote - the base DT's anoc_2_tbu node carries
++ * qcom,msm-bus,vectors-KBps = <0xa1 0x273 ...> precisely because the
++ * path from the TBU to memory needs raising through RPMh. USB's path
++ * works because ABL itself drove it and left its votes; the GPU
++ * driver proved both the need and the mechanism on this device
++ * (gpu_bus_vote raises MC0/SH0 through sweet_rpmh.c because nothing
++ * else does). Raise the TBU's segment the same way.
+  */
+ #define AS_PA           0x15000000ULL
+ #define AS_SIZE         0x100000
+@@ -556,6 +567,34 @@ tp_tbu_power_cycle(void)
+ 	    (tp_rd(st.gdsc, GDSC_TBU2_OFF) & GDSC_PWR_ON) ? 1u : 0u);
+ }
+ 
++/*
++ * The last thing the vendor TBU driver does for this path, and the
++ * only thing on this boot nobody has ever done: the base DT's
++ * anoc_2_tbu node carries qcom,msm-bus,vectors-KBps = <0xa1 0x273
++ * ...> - a NoC vote for the TBU's path to memory, which the vendor
++ * bus driver raises through RPMh and which gates exactly the segment
++ * the last rounds proved missing: the request is matched, translated
++ * (no fault anywhere), and never answered. The GPU driver proves the
++ * mechanism and the need on this device (gpu_bus_vote raises MC0/SH0
++ * because nothing else does); the TBU's own segment is the anoc_2
++ * side. The RPMh resource name for it is not known here, so print
++ * the firmware's own resource table once, then ask for the plausible
++ * names at top level: a lookup miss is a harmless refusal, a hit
++ * raises the clock (RPMh takes the maximum of all votes, and the GPU
++ * already raised the memory-side ones).
++ */
++static void
++tp_bus_vote(void)
++{
++	static const char *const names[] = { "MMC", "MF0", "MMO", "ANOC", "MMN" };
++	sweet_rpmh_dump_db();
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
++		uint32_t off = 0, val = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
++		int rc = sweet_rpmh_write(names[i], 1, &off, &val);
++		printf("SWEET S3706: bus vote %s -> %d\n", names[i], rc);
++	}
++}
++
+ /* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
+ static void
+ tp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+@@ -1055,6 +1094,7 @@ tp_thread(void *arg, wait_result_t result)
+ 	}
+ 	tp_smmu_reset_stale(); /* a stale fault record stalls the bank */
+ 	tp_tbu_power_cycle();  /* the domain is the vendor's TBU reset */
++	tp_bus_vote();         /* the TBU's NoC path: the vendor's own vote */
+ 	printf("SWEET S3706: TLMM cfg/io en=%#x/%#x reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_EN1V8)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_EN1V8)),
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_RESET)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_RESET)),
