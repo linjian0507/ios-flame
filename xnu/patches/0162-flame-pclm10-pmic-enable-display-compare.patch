@@ -1,0 +1,225 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 085ffa5..03a727a 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -1120,8 +1120,9 @@ tp_pmic_gpio_diagnostic(void)
+ 	}
+ }
+ 
+-/* Preserve the inherited 1.8 V state; only its PMIC registers are read.
+- * The AVDD vote and reset sequence are unchanged from the prior round. */
++/* Vendor power order: AVDD vote, then panel 1.8 V enable through PM8150L
++ * GPIO5, 10 ms, release RES#, 80 ms boot. Keep RES# asserted while rails
++ * settle. The 1.8 V write is restricted to this one owned GPIO. */
+ static bool
+ tp_power_on(void)
+ {
+@@ -1136,10 +1137,21 @@ tp_power_on(void)
+ 		printf("SWEET S3706: LDO-A17 RPMh enable failed %d; stopping\n", err);
+ 		return false;
+ 	}
++	/* A15 readback: GPIO5 was an enabled LV input with pull-down, not the
++	 * output-high the vendor touch driver uses. Now that type/subtype and
++	 * apps-EE ownership are observed, drive this one pin through the
++	 * restricted PMIC helper and read its state back. */
++	int prc = sweet_spmi_touch_gpio_set(true);
++	printf("SWEET S3706: PM8150L GPIO5 enable-high rc=%d\n", prc);
++	if (prc) {
++		printf("SWEET S3706: PMIC touch enable failed; stopping\n");
++		return false;
++	}
++	tp_pmic_gpio_diagnostic();
+ 	tp_wait(10); /* POWEWRUP_TO_RESET_TIME */
+ 	tp_gpio(TP_PIN_RESET, 0, 0, 0, true, true);
+ 	tp_wait(80); /* RESET_TO_NORMAL_TIME */
+-	printf("SWEET S3706: AVDD vote accepted; PMIC 1.8V state unchanged; reset released; irq-pin=%u\n",
++	printf("SWEET S3706: AVDD + PM8150L 1.8V enable set; reset released; irq-pin=%u\n",
+ 	    tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_IRQ)) & 1u);
+ 	return true;
+ }
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index d1f6702..2b90673 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -107,16 +107,12 @@ sp_read_allowed(unsigned sid, unsigned addr)
+ 	return base_read || touch_gpio_read;
+ }
+ 
+-int
+-sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++/* Caller holds sp_lock and has validated the permitted range. */
++static int
++sp_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	if (!sp_ready || !out || !sp_read_allowed(sid, addr)) {
+-		return -1;
+-	}
+-	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+ 	unsigned off = 0x80u * apid;
+@@ -128,11 +124,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -140,10 +134,21 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+-	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
+ 
++int
++sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	if (!sp_ready || !out || !sp_read_allowed(sid, addr)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	int rc = sp_read_locked(sid, addr, out);
++	IOLockUnlock(sp_lock);
++	return rc;
++}
++
+ /* Read-only owner query for the single PM8150L GPIO used by the PCLM10
+  * touch panel. This never maps or submits to the write channel. */
+ int
+@@ -164,6 +169,91 @@ sweet_spmi_touch_gpio_owner(unsigned *apid_out, unsigned *owner_out)
+ 	return 0;
+ }
+ 
++/*
++ * Drive the single PM8150L LV GPIO5 that the board overlay names as the
++ * PCLM10 touchpanel 1.8 V enable. Restrict the write channel to its exact
++ * register block, require apps-EE ownership, and require type/subtype LV
++ * before changing anything. The sequence is the vendor pinctrl driver's
++ * config_set order, with master enable last. Only this GPIO is writable.
++ */
++static uint8_t
++sp_touch_gpio_reg_value(uint16_t addr, int high)
++{
++	switch (addr) {
++	case 0xc441: return 0x00;      /* VIN0 */
++	case 0xc442: return 0x05;      /* bias disable */
++	case 0xc445: return 0x03;      /* CMOS, high strength */
++	case 0xc443: return 0x00;      /* no dtest */
++	case 0xc440: return 0x01;      /* digital output */
++	case 0xc444: return high ? 0x80 : 0x00; /* invert=level */
++	case 0xc446: return 0x80;      /* master enable */
++	default: return 0;
++	}
++}
++
++int
++sweet_spmi_touch_gpio_set(int high)
++{
++	static const uint16_t addr[] = {
++		0xc441, 0xc442, 0xc445, 0xc443, 0xc440, 0xc444, 0xc446,
++	};
++	uint8_t type = 0, subtype = 0;
++	if (!sp_ready) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((4u << 8) | 0xc4u);
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	if (owner != 0) {
++		printf("SWEET BATTERY: PM8150L GPIO5 write refused, APID %u owner %u\n",
++		    apid, owner);
++		IOLockUnlock(sp_lock);
++		return -2;
++	}
++	if (sp_read_locked(4, 0xc404, &type) || sp_read_locked(4, 0xc405, &subtype) ||
++	    type != 0x10 || subtype != 0x10) {
++		printf("SWEET BATTERY: PM8150L GPIO5 type=%#x subtype=%#x; refusing write\n",
++		    type, subtype);
++		IOLockUnlock(sp_lock);
++		return -3;
++	}
++	vm_offset_t ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (ch == 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	for (unsigned i = 0; i < sizeof(addr) / sizeof(addr[0]); ++i) {
++		uint8_t value = sp_touch_gpio_reg_value(addr[i], high);
++		*(volatile uint32_t *)(ch + 0x10u) = value;
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(ch + 0x00u) = (addr[i] & 0xffu) << 4;
++		__asm__ volatile("dsb osh" ::: "memory");
++		bool done = false;
++		uint32_t status = 0;
++		for (unsigned n = 0; n < 1000; ++n) {
++			status = *(volatile uint32_t *)(ch + 0x08u);
++			if (status & 1u) {
++				done = true;
++				break;
++			}
++			delay(1);
++		}
++		if (!done || (status & 0x0eu)) {
++			sp_poisoned[apid] = true;
++			printf("SWEET BATTERY: PM8150L GPIO5 write %#x failed status=%#x\n",
++			    addr[i], status);
++			IOLockUnlock(sp_lock);
++			return -4;
++		}
++	}
++	IOLockUnlock(sp_lock);
++	return 0;
++}
++
+ /*
+  * One-byte write for the PMIC PON block. The ABL turns PON soft spare 0x88f
+  * into the boot mode it selects next, so the kernel writes the same "bootloader"
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index f4bb358..812991c 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -10,6 +10,8 @@ int sweet_spmi_init(void);
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* Read-only APID and owner for PCLM10 PM8150L GPIO5; thread context. */
+ int sweet_spmi_touch_gpio_owner(unsigned *apid_out, unsigned *owner_out);
++/* Set the PCLM10 PM8150L GPIO5 touch 1.8 V enable; thread context. */
++int sweet_spmi_touch_gpio_set(int high);
+ /* PMIC PON block only (peripheral 0x08): the ABL's boot-reason byte. */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9348451..19d3ae4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -268,7 +268,7 @@ sweet_fb_compare_cpu(const uint8_t *src, const uint8_t *dst,
+ 		enabled = 0;
+ 		PE_parse_boot_argn("sweetfb_compare", &enabled, sizeof(enabled));
+ 	}
+-	if (!enabled || samples >= 10 || w <= 0 || h <= 0 ||
++	if (!enabled || samples >= 12 || w <= 0 || h <= 0 ||
+ 	    dx != 0 || dy != 0 || (uint32_t)w != panel_w ||
+ 	    (uint32_t)h != panel_h || corner_extent * 2u >= panel_h) {
+ 		return;
+@@ -296,7 +296,7 @@ sweet_fb_compare_cpu(const uint8_t *src, const uint8_t *dst,
+ 	}
+ 	/* Do not spend all ten samples on consecutive animation frames. */
+ 	static uint32_t eligible;
+-	if ((eligible++ % 15u) != 0) {
++	if ((eligible++ % 3u) != 0) {
+ 		return;
+ 	}
+ 	uint64_t checked = 0, mismatch = 0;

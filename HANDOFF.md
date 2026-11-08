@@ -5,6 +5,25 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 0162: PM8150L GPIO5 enable write (2026-11-09)
+
+- Kernel 0161 boot (capture `work/usb-log-20261109-001018/`, image
+  `e15550880f87c345e03346e0ce8cda0d613c268d32c1cf37200155d642ea2dc4`)
+  completed and returned to fastboot. Read-only PMIC diagnosis observed
+  SID4 peripheral 0xc400, APID 318, owner 0, type/subtype `0x10/0x10`
+  (LV GPIO), mode `0x00` (input), pull `0x04` (pull-down), out-source
+  `0x00`, enable `0x80`. The vendor S3706 driver drives this pin high;
+  the inherited input/pull-down state is consistent with an unpowered
+  1.8 V rail, but no voltage was measured.
+- Touch still failed at page select with M/TX DMA active and IOS=0.
+  Display compare sampled one early frame with zero mismatches; the
+  later red/blue frame was not compared because the budget was spent.
+- Patch 0162 adds `sweet_spmi_touch_gpio_set()`, restricted to the GPIO5
+  register block, owner 0, and type/subtype 0x10/0x10; writes follow the
+  vendor pinctrl config order with master enable last. The PON writer and
+  all other PMIC access are unchanged. Display compare now keeps 12
+  samples every third eligible frame. Hardware result pending.
+
 ### PCLM10 0161: PMIC GPIO identity and display diagnostics (2026-11-08)
 
 - Observed in the locally decoded board overlay: the S3706 `enable1v8_gpio`

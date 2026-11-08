@@ -66,7 +66,15 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 ## Flame patches
 
-- PCLM10 fork 0161: stop treating SoC GPIO5 as the panel 1.8 V enable; add bounded read-only PM8150L GPIO5/APID diagnostics and opt-in CPU framebuffer source/panel comparison. Both touch and display fixes remain unverified on hardware.
+- PCLM10 fork 0162: first touch 1.8 V write. A16 register read showed
+  PM8150L GPIO5 owned by EE0, valid LV GPIO, but left input/pull-down.
+  The patch writes only its register block after type/subtype/owner checks,
+  in vendor pinctrl order; display comparison sampling widened. Hardware
+  result pending.
+- PCLM10 fork 0161: read-only PM8150L GPIO5/APID diagnostics and opt-in
+  CPU framebuffer source/panel comparison. Confirmed on hardware that
+  GPIO5 is an owned LV input with pull-down; touch still failed. Display
+  compare matched one early frame; later red/blue frame not compared.
 
 - PCLM10 fork 0137: opt-in `sweetresetdiag=1` final-action reset gate (leave
   panic notifications intact), record reboot PID/name/howto/caller, and

@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0161-flame-pclm10-pmic-display-diagnostics.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0162-flame-pclm10-pmic-enable-display-compare.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -59,9 +59,11 @@ def compile_and_run(cpp: bool, code: str) -> None:
         source = Path(tmp) / ("test.cpp" if cpp else "test.c")
         binary = Path(tmp) / "test"
         source.write_text(code, encoding="utf-8")
+        env = dict(os.environ, TMPDIR=tmp)
         subprocess.run([compiler, "-std=c++17" if cpp else "-std=c11", "-Wall",
-                        "-Wextra", "-Werror", str(source), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+                        "-Wextra", "-Werror", str(source), "-o", str(binary)],
+                       check=True, env=env)
+        subprocess.run([str(binary)], check=True, env=env)
 
 
 class PMICDisplayTests(unittest.TestCase):
@@ -107,7 +109,7 @@ int main(void) {
 '''
         compile_and_run(False, harness)
 
-    def test_write_path_not_extended(self):
+    def test_touch_gpio_write_is_restricted(self):
         now = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
         writer = extract_function(now, "sweet_spmi_write")
         self.assertIn("sid != 0", writer)
@@ -119,6 +121,35 @@ int main(void) {
         touch = (ACTIVE_SOURCE / "bsd/dev/sweet_s3706.c").read_text(encoding="utf-8")
         self.assertNotIn("TP_PIN_EN1V8", touch)
         self.assertNotIn("sweet_spmi_write(", touch)
+        setter = extract_function(now, "sweet_spmi_touch_gpio_set")
+        self.assertIn("owner != 0", setter)
+        self.assertIn("type != 0x10 || subtype != 0x10", setter)
+        self.assertIn("sp_read_locked(4, 0xc404", setter)
+        order = ["0xc441", "0xc442", "0xc445", "0xc443", "0xc440", "0xc444", "0xc446"]
+        self.assertEqual([setter.index(x) for x in order], sorted(setter.index(x) for x in order))
+        self.assertIn("sweet_spmi_touch_gpio_set(true)", touch)
+        self.assertIn("tp_pmic_gpio_diagnostic();", touch[touch.index("sweet_spmi_touch_gpio_set(true)"):])
+
+    def test_touch_gpio_register_values(self):
+        src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
+        fn = extract_function(src, "sp_touch_gpio_reg_value")
+        harness = r'''
+#include <stdint.h>
+#include <stdio.h>
+''' + fn + r'''
+int main(void) {
+    if (sp_touch_gpio_reg_value(0xc441, 1) != 0x00) return 1;
+    if (sp_touch_gpio_reg_value(0xc442, 1) != 0x05) return 2;
+    if (sp_touch_gpio_reg_value(0xc445, 1) != 0x03) return 3;
+    if (sp_touch_gpio_reg_value(0xc443, 1) != 0x00) return 4;
+    if (sp_touch_gpio_reg_value(0xc440, 1) != 0x01) return 5;
+    if (sp_touch_gpio_reg_value(0xc444, 1) != 0x80) return 6;
+    if (sp_touch_gpio_reg_value(0xc444, 0) != 0x00) return 7;
+    if (sp_touch_gpio_reg_value(0xc446, 1) != 0x80) return 8;
+    return 0;
+}
+'''
+        compile_and_run(False, harness)
 
     @unittest.skipIf(SOURCE_FLAG, "original local CI build tree not present in CI")
     def test_original_writer_byte_identical(self):
@@ -141,8 +172,8 @@ int main(void) {
         if not git:
             self.skipTest("git not available")
         for path, digest in expected.items():
-            result = subprocess.run([git, "show", f"HEAD~1:{path}"], cwd=SOURCE,
-                                    check=True, stdout=subprocess.PIPE)
+            result = subprocess.run([git, "show", f"af249f8d5da5e4663a32a889f633f82262943b99:{path}"],
+                                    cwd=SOURCE, check=True, stdout=subprocess.PIPE)
             self.assertEqual(hashlib.sha256(result.stdout).hexdigest(), digest, path)
 
     def test_display_comparison_against_synthetic_frames(self):
@@ -192,6 +223,57 @@ int main() {
 '''
         compile_and_run(True, harness)
 
+    def test_display_comparison_disabled_and_uniform(self):
+        src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        fn = extract_function(src, "sweet_fb_compare_cpu")
+        harness = r'''
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+static int on, logs;
+static void PE_parse_boot_argn(const char *, int *v, unsigned long) { *v = on; }
+static void IOLog(const char *, ...) { logs++; }
+''' + fn + r'''
+int main() {
+    const uint32_t W=64, H=64;
+    std::vector<uint8_t> pixels(W*H*4, 0);
+    sweet_fb_compare_cpu(pixels.data(), pixels.data(), W*4, W*4,
+                         0,0,0,0,W,H,W,H,0);
+    if (logs) return 1;  // boot argument defaults to off
+    on=1;
+    sweet_fb_compare_cpu(pixels.data(), pixels.data(), W*4, W*4,
+                         0,0,0,0,W,H,W,H,0);
+    if (logs) return 2;  // cached disabled state must remain disabled
+    return 0;
+}
+'''
+        compile_and_run(True, harness)
+
+    def test_display_comparison_rejects_uniform_when_enabled(self):
+        src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        fn = extract_function(src, "sweet_fb_compare_cpu")
+        harness = r'''
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+static int logs;
+static void PE_parse_boot_argn(const char *, int *v, unsigned long) { *v = 1; }
+static void IOLog(const char *, ...) { logs++; }
+''' + fn + r'''
+int main() {
+    const uint32_t W=64, H=64;
+    std::vector<uint8_t> pixels(W*H*4, 23);
+    sweet_fb_compare_cpu(pixels.data(), pixels.data(), W*4, W*4,
+                         0,0,0,0,W,H,W,H,0);
+    if (logs) return 1;
+    pixels[((size_t)H/4*W)*4] = 55;
+    sweet_fb_compare_cpu(pixels.data(), pixels.data(), W*4, W*4,
+                         0,0,0,0,W,H,W,H,0);
+    return logs == 1 ? 0 : 2;
+}
+'''
+        compile_and_run(True, harness)
+
     @unittest.skipIf(SOURCE_FLAG, "local PCLM10 profiles not part of CI checkout")
     def test_profile_is_one_diagnostic_argument(self):
         import importlib.util
@@ -201,16 +283,28 @@ int main() {
         self.assertEqual(module.args("unixnu-p4-touch-pmicdiag.toml"),
                          module.args("unixnu-p4-touch.toml") + ["sweetfb_compare=1"])
 
+    @unittest.skipIf(SOURCE_FLAG, "requires the board's DT and on-device log")
+    def test_identifies_cpu_center_crop_without_claiming_correct_output(self):
+        text = (ROOT / "work/usb-log-20261108-222720/live-log.txt").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("AppleCLCD 1080x2400", text)
+        self.assertIn("presented as 1125x2436", text)
+        self.assertIn("surface 3 1125x2436 fmt 0x42475241", text)
+        source = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        self.assertIn("fOffX = (int32_t)(fLogicalW - fWidth) / 2", source)
+        self.assertIn("dx -= fOffX", source)
+        self.assertEqual(((1125 - 1080) // 2, (2436 - 2400) // 2), (22, 18))
+
     @unittest.skipIf(SOURCE_FLAG, "local CI preimage not present in CI checkout")
     def test_patch_applies_to_exact_ci_sources(self):
         git = shutil.which("git")
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/patch-0160/post/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0149/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0149/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0144/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0161-r42496120098/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0161-r42496120098/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0161-r42496120098/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0161-r42496120098/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:
@@ -219,8 +313,9 @@ int main() {
                 dest = root / relative
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(original, dest)
-            subprocess.run([git, "apply", "--check", str(PATCH)], cwd=root, check=True)
-            subprocess.run([git, "apply", str(PATCH)], cwd=root, check=True)
+                dest.chmod(0o644)
+            subprocess.run([git, "-c", "core.filemode=false", "apply", "--check", str(PATCH)], cwd=root, check=True)
+            subprocess.run([git, "-c", "core.filemode=false", "apply", str(PATCH)], cwd=root, check=True)
             for relative in originals:
                 self.assertEqual((root / relative).read_bytes(), (SOURCE / relative).read_bytes(), relative)
 
