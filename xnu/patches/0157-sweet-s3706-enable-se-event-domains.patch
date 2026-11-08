@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index b1c3334..e410322 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -24,6 +24,8 @@
+  * RESUME_TERMINATE, its exact QUPv3_2-to-DDR NoC path raised through
+  * RPMh, and the SMMU's global TLB invalidated/synchronized before
+  * publishing the stream match - the proven GPU driver's sequence;
++ * and the GENI/DMA event domains are enabled exactly as the vendor's
++ * geni_se_init(), even though completion is polled rather than IRQed;
+  * TLMM is reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+@@ -147,6 +149,12 @@ void sweet_s3706_init(void);
+ #define SE_DRX_IRQ_EN_SET 0xd4cu
+ #define SE_DRX_LEN_IN     0xd54u
+ #define SE_DRX_FLUSH      0xd60u
++#define SE_GSI_EVENT_EN   0xe18u
++#define SE_IRQ_EN         0xe1cu
++#define SE_IRQ_DMA_RX     (1u << 0)
++#define SE_IRQ_DMA_TX     (1u << 1)
++#define SE_IRQ_GENI_M     (1u << 2)
++#define SE_IRQ_GENI_S     (1u << 3)
+ /* *_IRQ_EN_SET / *_IRQ bits (GENI_SE_DMA_*_EN) and *_IRQ_STAT bits
+  * (TX_DMA_DONE, TX_EOT, RX_DMA_DONE, RX_EOT, *_SBE, RX_FLUSH_DONE). */
+ #define DMA_DONE_EN       (1u << 0)
+@@ -931,8 +939,21 @@ tp_se_init(void)
+ 		printf("SWEET S3706: SE17 already busy; stopping\n");
+ 		return false;
+ 	}
+-	tp_wr(st.se, 0xe18, 0); /* no GSI events */
+-	tp_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	tp_wr(st.se, SE_GSI_EVENT_EN, 0); /* no GSI events */
++	/*
++	 * This is not merely CPU interrupt routing. Every vendor generation
++	 * (4.19, SM8150 5.4, and mainline) has geni_se_io_set_mode() set all
++	 * four SE_IRQ_EN domain gates during geni_se_init(): DMA RX/TX and
++	 * GENI M/S. Polling local status replaces the CPU handler, but it
++	 * does not replace these internal event-domain enables. Clearing the
++	 * register, as this driver did, can leave M_CMD0 latched while the M
++	 * sequencer and DMA engines never signal each other - exactly the
++	 * seen=0/dtx=0/drx=0 silence after every external path was proven.
++	 */
++	tp_wr(st.se, SE_IRQ_EN, SE_IRQ_DMA_RX | SE_IRQ_DMA_TX |
++	    SE_IRQ_GENI_M | SE_IRQ_GENI_S);
++	printf("SWEET S3706: SE event-domain gates=%#x (DMA RX/TX, GENI M/S)\n",
++	    tp_rd(st.se, SE_IRQ_EN));
+ 	tp_wr(st.se, 0x644, 0);
+ 	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	tp_wr(st.se, 0x648, 0xffffffffu);
