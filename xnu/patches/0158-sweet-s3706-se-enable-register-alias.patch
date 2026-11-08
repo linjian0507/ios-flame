@@ -1,0 +1,131 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index e410322..16b62fc 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -26,6 +26,8 @@
+  * publishing the stream match - the proven GPU driver's sequence;
+  * and the GENI/DMA event domains are enabled exactly as the vendor's
+  * geni_se_init(), even though completion is polled rather than IRQed;
++ * wrapper-domain and M-event enables use their distinct 0xe1c/0x614
++ * registers (never aliasing one another);
+  * TLMM is reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+@@ -107,13 +109,14 @@ void sweet_s3706_init(void);
+ #define SE_CMD          0x600u
+ #define SE_CTRL         0x604u
+ #define SE_IRQ          0x610u
+-#define SE_IRQ_EN       0x614u
++#define SE_M_IRQ_EN     0x614u
+ #define SE_IRQ_CLR      0x618u
+ #define SE_TX           0x700u
+ #define SE_RX           0x780u
+ #define SE_TX_COUNT     0x800u
+ #define SE_RX_COUNT     0x804u
+ #define SE_TX_WM        0x80cu
++#define SE_IOS          0x908u
+ #define SE_HW_TX        0xe24u
+ #define SE_HW_RX        0xe28u
+ #define SE_RX_WM_IRQ    (1u << 26)
+@@ -138,6 +141,7 @@ void sweet_s3706_init(void);
+ #define SE_DTX_LEN        0xc3cu
+ #define SE_DTX_IRQ        0xc40u /* status, write-1-to-clear below */
+ #define SE_DTX_IRQ_CLR    0xc44u
++#define SE_DTX_IRQ_EN     0xc48u
+ #define SE_DTX_IRQ_EN_SET 0xc4cu
+ #define SE_DTX_LEN_IN     0xc54u
+ #define SE_DRX_PTR_L      0xd30u
+@@ -146,15 +150,17 @@ void sweet_s3706_init(void);
+ #define SE_DRX_LEN        0xd3cu
+ #define SE_DRX_IRQ        0xd40u
+ #define SE_DRX_IRQ_CLR    0xd44u
++#define SE_DRX_IRQ_EN     0xd48u
+ #define SE_DRX_IRQ_EN_SET 0xd4cu
+ #define SE_DRX_LEN_IN     0xd54u
+ #define SE_DRX_FLUSH      0xd60u
+ #define SE_GSI_EVENT_EN   0xe18u
+-#define SE_IRQ_EN         0xe1cu
++#define SE_WRAPPER_IRQ_EN 0xe1cu
+ #define SE_IRQ_DMA_RX     (1u << 0)
+ #define SE_IRQ_DMA_TX     (1u << 1)
+ #define SE_IRQ_GENI_M     (1u << 2)
+ #define SE_IRQ_GENI_S     (1u << 3)
++#define SE_DMA_DEBUG      0xe40u
+ /* *_IRQ_EN_SET / *_IRQ bits (GENI_SE_DMA_*_EN) and *_IRQ_STAT bits
+  * (TX_DMA_DONE, TX_EOT, RX_DMA_DONE, RX_EOT, *_SBE, RX_FLUSH_DONE). */
+ #define DMA_DONE_EN       (1u << 0)
+@@ -753,6 +759,26 @@ tp_irq(void)
+ 	return st.irq_last;
+ }
+ 
++/* Vendor geni_se_dump_dbg_regs() evidence, captured before abort
++ * changes the command/DMA state. Read-only and limited to probing. */
++static void
++tp_se_dump(const char *why)
++{
++	printf("SWEET S3706: %s: cmd=%#x ctrl=%#x status=%#x irq=%#x ios=%#x dma=%#x dbg=%#x\n",
++	    why, tp_rd(st.se, SE_CMD), tp_rd(st.se, SE_CTRL),
++	    tp_rd(st.se, SE_STATUS), tp_rd(st.se, SE_IRQ),
++	    tp_rd(st.se, SE_IOS), tp_rd(st.se, SE_DMA),
++	    tp_rd(st.se, SE_DMA_DEBUG));
++	printf("SWEET S3706: %s: tx ptr=%08x:%08x attr=%#x len=%#x in=%#x irq=%#x; "
++	    "rx ptr=%08x:%08x attr=%#x len=%#x in=%#x irq=%#x\n", why,
++	    tp_rd(st.se, SE_DTX_PTR_H), tp_rd(st.se, SE_DTX_PTR_L),
++	    tp_rd(st.se, SE_DTX_ATTR), tp_rd(st.se, SE_DTX_LEN),
++	    tp_rd(st.se, SE_DTX_LEN_IN), tp_rd(st.se, SE_DTX_IRQ),
++	    tp_rd(st.se, SE_DRX_PTR_H), tp_rd(st.se, SE_DRX_PTR_L),
++	    tp_rd(st.se, SE_DRX_ATTR), tp_rd(st.se, SE_DRX_LEN),
++	    tp_rd(st.se, SE_DRX_LEN_IN), tp_rd(st.se, SE_DRX_IRQ));
++}
++
+ /*
+  * One message over the SE's own DMA engine: the geni_se_tx/rx_init_dma
+  * recipe (program PTR/ATTR/LEN, enable DONE|EOT|AHB_ERR, then trigger
+@@ -802,6 +828,12 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	}
+ 	tp_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	if (st.probing) {
++		printf("SWEET S3706: launch cmd=%#x status=%#x wrapper-en=%#x m-en=%#x dtx-en=%#x drx-en=%#x\n",
++		    tp_rd(st.se, SE_CMD), tp_rd(st.se, SE_STATUS),
++		    tp_rd(st.se, SE_WRAPPER_IRQ_EN), tp_rd(st.se, SE_M_IRQ_EN),
++		    tp_rd(st.se, SE_DTX_IRQ_EN), tp_rd(st.se, SE_DRX_IRQ_EN));
++	}
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 20000; ++i) {
+ 		uint32_t irq = tp_irq();
+@@ -853,6 +885,9 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	}
+ 	if (err == ETIMEDOUT) {
+ 		tp_smmu_dump("xfer timeout");
++		if (st.probing) {
++			tp_se_dump("xfer timeout before abort");
++		}
+ 	}
+ 	tp_abort();
+ 	return err;
+@@ -950,10 +985,10 @@ tp_se_init(void)
+ 	 * sequencer and DMA engines never signal each other - exactly the
+ 	 * seen=0/dtx=0/drx=0 silence after every external path was proven.
+ 	 */
+-	tp_wr(st.se, SE_IRQ_EN, SE_IRQ_DMA_RX | SE_IRQ_DMA_TX |
++	tp_wr(st.se, SE_WRAPPER_IRQ_EN, SE_IRQ_DMA_RX | SE_IRQ_DMA_TX |
+ 	    SE_IRQ_GENI_M | SE_IRQ_GENI_S);
+ 	printf("SWEET S3706: SE event-domain gates=%#x (DMA RX/TX, GENI M/S)\n",
+-	    tp_rd(st.se, SE_IRQ_EN));
++	    tp_rd(st.se, SE_WRAPPER_IRQ_EN));
+ 	tp_wr(st.se, 0x644, 0);
+ 	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	tp_wr(st.se, 0x648, 0xffffffffu);
+@@ -974,7 +1009,10 @@ tp_se_init(void)
+ 	tp_wr(st.se, SE_TX_WM, 0);
+ 	tp_wr(st.se, 0x810, 0);
+ 	tp_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	tp_wr(st.se, SE_IRQ_EN, SE_DONE | SE_ERRORS); /* no FIFO watermarks */
++	tp_wr(st.se, SE_M_IRQ_EN, SE_DONE | SE_ERRORS); /* no FIFO watermarks */
++	printf("SWEET S3706: SE enables wrapper=%#x m=%#x dma-tx=%#x dma-rx=%#x\n",
++	    tp_rd(st.se, SE_WRAPPER_IRQ_EN), tp_rd(st.se, SE_M_IRQ_EN),
++	    tp_rd(st.se, SE_DTX_IRQ_EN), tp_rd(st.se, SE_DRX_IRQ_EN));
+ 	if (tp_rd(st.se, 0x260) != SE_PACK0 || tp_rd(st.se, 0x264) != SE_PACK1 ||
+ 	    tp_rd(st.se, 0x284) != SE_PACK0 || tp_rd(st.se, 0x288) != SE_PACK1 ||
+ 	    tp_rd(st.se, 0x254) != 0) {
