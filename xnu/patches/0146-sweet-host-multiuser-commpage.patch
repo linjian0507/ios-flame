@@ -1,0 +1,32 @@
+diff --git a/osfmk/kern/host.c b/osfmk/kern/host.c
+index 471f977..9463f8c 100644
+--- a/osfmk/kern/host.c
++++ b/osfmk/kern/host.c
+@@ -1386,7 +1386,16 @@ host_set_atm_diagnostic_flag(host_t host, uint32_t diagnostic_flag)
+ kern_return_t
+ host_set_multiuser_config_flags(host_priv_t host_priv, uint32_t multiuser_config)
+ {
+-#if !defined(XNU_TARGET_OS_OSX)
++	/*
++	 * PCLM10: this tree builds from macOS xnu-8796, so XNU_TARGET_OS_OSX
++	 * is defined even though the userspace is iOS 16. Upstream gates this
++	 * routine on !XNU_TARGET_OS_OSX; the compiled stub returned
++	 * KERN_NOT_SUPPORTED (verified in the kernel binary), so usermanagerd's
++	 * boot step "Set Foreground ID + multiuser in commpage" could never
++	 * succeed and no foreground user was ever set: no user-domain agents
++	 * run and the lock screen falls back to its no-user theme. Apple's iOS
++	 * kernels always take the branch below, so take it unconditionally.
++	 */
+ 	if (host_priv == HOST_PRIV_NULL) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+@@ -1398,9 +1407,4 @@ host_set_multiuser_config_flags(host_priv_t host_priv, uint32_t multiuser_config
+ 	 */
+ 	commpage_update_multiuser_config(multiuser_config);
+ 	return KERN_SUCCESS;
+-#else
+-	(void)host_priv;
+-	(void)multiuser_config;
+-	return KERN_NOT_SUPPORTED;
+-#endif
+ }

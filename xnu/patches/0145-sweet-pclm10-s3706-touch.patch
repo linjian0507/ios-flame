@@ -1,0 +1,785 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index df7c863..6e00153 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
++bsd/dev/sweet_s3706.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+new file mode 100644
+index 0000000..1ce865e
+--- /dev/null
++++ b/bsd/dev/sweet_s3706.c
+@@ -0,0 +1,656 @@
++/*
++ * PCLM10 touch: Synaptics S3706 (RMI4) on GENI I2C SE17 (QUPv3 wrap2 SE0).
++ * Call once after the scheduler is running; all work runs on one thread.
++ *
++ * Sources: the vendor driver for this exact chip and panel (kept in this
++ * project at work/ref/synaptics_drivers_s3706.c), the PCLM10 DTBO
++ * (synaptics19081@20: address 0x20, reset GPIO 54, IRQ GPIO 122, 1.8 V
++ * enable GPIO 5, AVDD 3.0 V, 1080x2400 panel, 10 fingers), and the
++ * SM8150 clock driver (wrap2 s_ahb/m_ahb/SE0 APCS votes 0x52014 bits
++ * 1/2/4, branch CRs 0x1e004/0x1e008/0x1e144, RCG 0x1e148 = XO/1). The
++ * IC keeps its firmware and configuration in flash; this driver only
++ * powers, resets, reads descriptors, and polls reports. The GENI SE must
++ * be in ABL/XBL-loaded I2C firmware mode with FIFO access, polled exactly
++ * like sweet_touch.c; TLMM is reached through the south tile like
++ * sweet_fts.c (same SoC, proven there). Coordinates are already panel
++ * pixels (DTBO panel-coords = display-coords = 1080x2400).
++ * Boot-args: s3706=1 enable (default off), s3706delay=N start after N s
++ * (default 20), s3706log=1 log every report.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_s3706_init(void);
++
++#define TP_SE_PA       0x00c80000u     /* i2c17 = qupv3_se17 = wrap2 SE0 */
++#define TP_GCC_PA      0x00100000u
++#define TP_TLMM_PA     0x03d00000u     /* TLMM south tile (as sweet_fts.c) */
++#define TP_GCC_VOTE    0x52014u        /* APCS votes: s_ahb 1, m_ahb 2, s0 4 */
++#define TP_VOTE_BITS   ((1u << 1) | (1u << 2) | (1u << 4))
++#define TP_RCG         0x1e148u        /* gcc_qupv3_wrap2_s0_clk_src */
++#define TP_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define TP_GPIO_IO(n)  (TP_GPIO_CFG(n) + 4u)
++#define TP_PIN_EN1V8   5               /* 1.8 V enable, driven high (vendor) */
++#define TP_PIN_RESET   54              /* RES#, active low */
++#define TP_PIN_SDA     55              /* qup17 = function 1 */
++#define TP_PIN_SCL     56
++#define TP_PIN_IRQ     122             /* attention: idle high, low when ready */
++#define TP_MAX         10u
++#define TP_ADDR        0x20u
++#define TP_PANEL_W     1080
++#define TP_PANEL_H     2400
++
++/*
++ * RMI4/S3706 protocol, exactly as the vendor driver runs it on this panel:
++ * select page 0 (reg 0xff), read 4-byte F12/F01/F34 descriptors at
++ * 0xdd/0xe3/0xe9; the attention word is a 16-bit little-endian read at
++ * F12 data base + 3 (bits 0..9 = per-finger attention); the report is 8
++ * bytes per finger from the data base: status at +0 (0 = wrong point, the
++ * common layer skips those), x from +1/+2, y from +3/+4 (12-bit, panel
++ * space). Power: AVDD, then the 1.8 V enable, 10 ms, release reset, 80 ms
++ * boot (POWEWRUP_TO_RESET_TIME/RESET_TO_NORMAL_TIME).
++ */
++#define RMI_PAGE       0xffu
++#define RMI_F12_DESC   0xddu
++#define RMI_F01_DESC   0xe3u
++#define RMI_F34_DESC   0xe9u
++#define RMI_ATT_OFF    3u
++#define RMI_POINT_LEN  8u
++
++/* GENI SE registers, I2C variant (identical layout to sweet_touch.c). */
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++                         (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++/* geni_se_config_packing(8, 4, true, true, true): as sweet_touch.c. */
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead, probing;
++	int log;
++	uint32_t irq_status, irq_last;
++	unsigned sent, got;
++	uint8_t f12_data;
++	uint32_t active;
++	unsigned logged;
++	int x[TP_MAX], y[TP_MAX];
++} st;
++static int tp_sleep_chan;
++
++static uint32_t
++tp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++tp_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++tp_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&tp_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++tp_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(tp_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
++static void
++tp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = TP_GPIO_CFG(pin);
++	uint32_t cfg = tp_rd(st.gpio, off);
++	if (out) {
++		tp_wr(st.gpio, TP_GPIO_IO(pin),
++		    (tp_rd(st.gpio, TP_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	tp_wr(st.gpio, off, cfg);
++}
++
++static bool
++tp_clocks(void)
++{
++	/*
++	 * Vote on only wrap2 s_ahb, m_ahb, and the SE0 branch, preserving any
++	 * other clock user (recipe proven by sweet_fts.c on the same SoC).
++	 * The wrapper core clocks are not modelled in the clock driver; their
++	 * halt CRs (0x1e00c/0x1e010) are logged so a missing vote is visible
++	 * if the SE registers below read dead.
++	 */
++	tp_wr(st.gcc, TP_GCC_VOTE, tp_rd(st.gcc, TP_GCC_VOTE) | TP_VOTE_BITS);
++	uint32_t dfs = tp_rd(st.gcc, TP_RCG + 0x14u);
++	uint32_t cfg = tp_rd(st.gcc, TP_RCG + 4u);
++	printf("SWEET S3706: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    tp_rd(st.gcc, TP_GCC_VOTE), tp_rd(st.gcc, TP_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
++		cfg = tp_rd(st.gcc, TP_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET S3706: DFS level0=%#x is not XO/1; stopping\n", cfg);
++			return false;
++		}
++	} else {
++		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		tp_wr(st.gcc, TP_RCG + 4u, cfg);
++		tp_wr(st.gcc, TP_RCG, tp_rd(st.gcc, TP_RCG) | 1u);
++		if (!tp_wait_clear(st.gcc, TP_RCG, 1u)) {
++			printf("SWEET S3706: RCG update timeout\n");
++			return false;
++		}
++	}
++	/*
++	 * Branch halt bits: wrap2 m_ahb, s_ahb, s0. A branch under hardware
++	 * clock gating (bit 1) reads halted while idle; Linux skips the check
++	 * then, so do the same.
++	 */
++	const uint32_t branches[] = {0x1e004, 0x1e008, 0x1e144};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		uint32_t cbcr = tp_rd(st.gcc, branches[i]);
++		printf("SWEET S3706: GCC branch %#x = %#x\n", branches[i], cbcr);
++		if (cbcr & 2u) {
++			continue;
++		}
++		if (!tp_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("SWEET S3706: GCC branch %#x halted (%#x)\n", branches[i],
++			    tp_rd(st.gcc, branches[i]));
++			return false;
++		}
++	}
++	printf("SWEET S3706: wrapper core CRs %#x/%#x\n",
++	    tp_rd(st.gcc, 0x1e00c), tp_rd(st.gcc, 0x1e010));
++	return true;
++}
++/* Called only for a transfer started by this driver, including a stretched TX. */
++static void
++tp_abort(void)
++{
++	tp_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (tp_rd(st.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !tp_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		printf("SWEET S3706: abort failed status=%#x irq=%#x; stopping\n",
++		    tp_rd(st.se, SE_STATUS), tp_rd(st.se, SE_IRQ));
++	}
++	for (unsigned i = 0; i < 64 && (tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)tp_rd(st.se, SE_RX);
++	}
++	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (tp_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
++		st.dead = true;
++		printf("SWEET S3706: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++static uint32_t
++tp_irq(void)
++{
++	st.irq_last = tp_rd(st.se, SE_IRQ);
++	st.irq_status |= st.irq_last;
++	return st.irq_last;
++}
++
++/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++static int
++tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!tp_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true; /* no other SE17 owner is supported */
++		return EBUSY;
++	}
++	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	tp_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
++	tp_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	tp_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = tp_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = tp_irq();
++			}
++			if ((irq & SE_DONE) && !(tp_rd(st.se, SE_STATUS) & 1u) &&
++			    !(tp_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				tp_wr(st.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			tp_wr(st.se, SE_TX, word);
++			st.sent = nt;
++			tp_wr(st.se, SE_TX_WM, 0);
++		}
++		uint32_t count = tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = tp_rd(st.se, SE_RX);
++			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
++				rx[st.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = tp_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			tp_wr(st.se, SE_IRQ_CLR, irq);
++			if (st.got == nr && st.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		tp_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	tp_abort();
++	return err;
++}
++
++static int
++tp_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	st.irq_status = st.irq_last = 0;
++	st.sent = st.got = 0;
++	int err = tp_msg_run(addr, tx, nt, rx, nr, stretch);
++	if (st.probing) {
++		printf("SWEET S3706: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
++		    err, st.irq_last, st.irq_status, st.sent, st.got,
++		    tp_rd(st.se, SE_STATUS));
++	}
++	return err;
++}
++
++/* Register read: one-byte pointer write with a repeated START, then read. */
++static int
++tp_read_reg(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	uint8_t ptr = reg;
++	int err = tp_msg(addr, &ptr, 1, NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	return tp_msg(addr, NULL, 0, buf, len, false);
++}
++
++static int
++tp_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
++{
++	uint8_t tx[2] = {reg, val};
++	return tp_msg(addr, tx, 2, NULL, 0, false);
++}
++
++static int
++tp_read_word(uint8_t addr, uint8_t reg, uint16_t *val)
++{
++	uint8_t b[2];
++	int err = tp_read_reg(addr, reg, b, 2);
++	if (!err) {
++		*val = (uint16_t)(b[0] | ((uint16_t)b[1] << 8)); /* RMI4 is LE */
++	}
++	return err;
++}
++
++static bool
++tp_se_init(void)
++{
++	uint32_t fw = tp_rd(st.se, SE_FW);
++	uint32_t tx = tp_rd(st.se, SE_HW_TX), rx = tp_rd(st.se, SE_HW_RX);
++	printf("SWEET S3706: se17 fw=%#x proto=%u status=%#x tx=%#x rx=%#x hwid=%#x\n",
++	    fw, (fw >> 8) & 0xffu, tp_rd(st.se, SE_STATUS), tx, rx, tp_rd(st.se, 0x000));
++	if (((fw >> 8) & 0xffu) != 3u || (tp_rd(st.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("SWEET S3706: need ABL-loaded I2C firmware and 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (tp_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET S3706: SE17 already busy; stopping\n");
++		return false;
++	}
++	tp_wr(st.se, 0xe18, 0); /* no GSI events */
++	tp_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	tp_wr(st.se, 0x644, 0);
++	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	tp_wr(st.se, 0x648, 0xffffffffu);
++	tp_wr(st.se, SE_DMA, 0);
++	tp_wr(st.se, 0x28, tp_rd(st.se, 0x28) | 0x7fu);
++	tp_wr(st.se, 0xe30, tp_rd(st.se, 0xe30) | 0x0fu);
++	tp_wr(st.se, 0x24, 0x7f);
++	tp_wr(st.se, 0x20, 1);
++	tp_wr(st.se, SE_CLK_SEL, 0);
++	tp_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++	tp_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
++	tp_wr(st.se, 0x254, 0);
++	tp_wr(st.se, 0x260, SE_PACK0);
++	tp_wr(st.se, 0x264, SE_PACK1);
++	tp_wr(st.se, 0x284, SE_PACK0);
++	tp_wr(st.se, 0x288, SE_PACK1);
++	tp_wr(st.se, SE_TX_WM, 0);
++	tp_wr(st.se, 0x810, 0);
++	tp_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	tp_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	if (tp_rd(st.se, 0x260) != SE_PACK0 || tp_rd(st.se, 0x264) != SE_PACK1 ||
++	    tp_rd(st.se, 0x284) != SE_PACK0 || tp_rd(st.se, 0x288) != SE_PACK1 ||
++	    tp_rd(st.se, 0x254) != 0) {
++		printf("SWEET S3706: packing readback mismatch; stopping\n");
++		return false;
++	}
++	if ((tp_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET S3706: inherited FIFO data; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++/* Vendor power_control + reset, in physical levels: AVDD, 1.8 V enable high,
++ * 10 ms, release RES#, 80 ms boot. Keep RES# asserted while rails settle. */
++static bool
++tp_power_on(void)
++{
++	tp_gpio(TP_PIN_RESET, 0, 0, 0, true, false);
++	tp_gpio(TP_PIN_EN1V8, 0, 0, 0, true, false);
++	tp_gpio(TP_PIN_IRQ, 0, 3, 3, false, false); /* input, 8 mA, pull-up */
++	int err = sweet_rpmh_vreg_enable("ldoa17", 3000); /* DTBO vdd_2v8 3.0 V */
++	if (err) {
++		printf("SWEET S3706: LDO-A17 RPMh enable failed %d; stopping\n", err);
++		return false;
++	}
++	tp_gpio(TP_PIN_EN1V8, 0, 0, 0, true, true);
++	tp_wait(10); /* POWEWRUP_TO_RESET_TIME */
++	tp_gpio(TP_PIN_RESET, 0, 0, 0, true, true);
++	tp_wait(80); /* RESET_TO_NORMAL_TIME */
++	printf("SWEET S3706: powered, reset released; irq-pin=%u\n",
++	    tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_IRQ)) & 1u);
++	return true;
++}
++
++static bool
++tp_probe_chip(void)
++{
++	if (tp_write_reg(TP_ADDR, RMI_PAGE, 0)) {
++		printf("SWEET S3706: page select failed; stopping\n");
++		return false;
++	}
++	uint8_t f12[4], f01[4], f34[4];
++	int e1 = tp_read_reg(TP_ADDR, RMI_F12_DESC, f12, 4);
++	int e2 = tp_read_reg(TP_ADDR, RMI_F01_DESC, f01, 4);
++	int e3 = tp_read_reg(TP_ADDR, RMI_F34_DESC, f34, 4);
++	printf("SWEET S3706: f12 err=%d query=%#x cmd=%#x ctrl=%#x data=%#x | f01 err=%d bases=%#x/%#x/%#x/%#x | f34 err=%d bases=%#x/%#x/%#x/%#x\n",
++	    e1, f12[0], f12[1], f12[2], f12[3],
++	    e2, f01[0], f01[1], f01[2], f01[3],
++	    e3, f34[0], f34[1], f34[2], f34[3]);
++	if (e1 || f12[3] == 0 || f12[3] > 0xf0u) {
++		printf("SWEET S3706: no usable F12 data base (err=%d base=%#x); stopping\n",
++		    e1, f12[3]);
++		return false;
++	}
++	st.f12_data = f12[3];
++	uint16_t att = 0xffff;
++	int ea = tp_read_word(TP_ADDR, (uint8_t)(st.f12_data + RMI_ATT_OFF), &att);
++	printf("SWEET S3706: attention word err=%d %#x (expect 0 while idle)\n", ea, att);
++	if (ea) {
++		return false;
++	}
++	return true;
++}
++
++static void
++tp_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < TP_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++/* One vendor-shaped poll: attention word, then 8 bytes per finger. */
++static int
++tp_poll_report(void)
++{
++	uint16_t att = 0;
++	int err = tp_read_word(TP_ADDR, (uint8_t)(st.f12_data + RMI_ATT_OFF), &att);
++	if (err) {
++		return err;
++	}
++	uint32_t mask = att & 0x3ffu;
++	if (mask == 0) {
++		tp_report(0, st.x, st.y);
++		return 0;
++	}
++	unsigned nf = 0;
++	for (unsigned i = 0; i < TP_MAX; ++i) {
++		if (mask & (1u << i)) {
++			nf = i + 1;
++		}
++	}
++	uint8_t buf[TP_MAX * RMI_POINT_LEN];
++	err = tp_read_reg(TP_ADDR, st.f12_data, buf, nf * RMI_POINT_LEN);
++	if (err) {
++		return err;
++	}
++	int x[TP_MAX] = {0}, y[TP_MAX] = {0};
++	uint32_t valid = 0;
++	for (unsigned i = 0; i < nf; ++i) {
++		if (!(mask & (1u << i))) {
++			continue;
++		}
++		const uint8_t *p = buf + i * RMI_POINT_LEN;
++		if (p[0] == 0) {
++			continue; /* vendor: status 0 marks a wrong point */
++		}
++		unsigned px = ((unsigned)(p[2] & 0x0fu) << 8) | p[1];
++		unsigned py = ((unsigned)(p[4] & 0x0fu) << 8) | p[3];
++		if (px > TP_PANEL_W - 1 || py > TP_PANEL_H - 1) {
++			if ((st.logged++ % 100u) == 0) {
++				printf("SWEET S3706: out-of-range pt %u %u,%u st=%#x raw %02x %02x %02x %02x %02x\n",
++				    i, px, py, p[0], p[0], p[1], p[2], p[3], p[4]);
++			}
++			return EIO;
++		}
++		valid |= 1u << i;
++		x[i] = (int)px;
++		y[i] = (int)py;
++	}
++	if (st.log || st.logged < 32u) {
++		st.logged++;
++		printf("SWEET S3706: report att=%#x valid=%#x %s\n", att, valid,
++		    valid ? "" : "(all status 0)");
++		for (unsigned i = 0; i < TP_MAX; ++i) {
++			if (valid & (1u << i)) {
++				printf("SWEET S3706:   pt %u %d,%d\n", i, x[i], y[i]);
++			}
++		}
++	}
++	tp_report(valid, x, y);
++	return 0;
++}
++
++static void
++tp_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	(void)arg;
++	(void)result;
++	/* Start late (boot-arg s3706delay, seconds): if the bus access below
++	 * hangs the SoC, the log channel and the UI got there first. */
++	(void)PE_parse_boot_argn("s3706delay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("s3706log", &st.log, sizeof(st.log));
++	printf("SWEET S3706: starting in %u s\n", delay_s);
++	tp_wait(delay_s * 1000u);
++	printf("SWEET S3706: mapping GCC/TLMM/SE17\n");
++	st.gcc = ml_io_map(TP_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(TP_TLMM_PA, 0x81000);
++	st.se = ml_io_map(TP_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("SWEET S3706: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET S3706: TLMM cfg/io en=%#x/%#x reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
++	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_EN1V8)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_EN1V8)),
++	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_RESET)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_RESET)),
++	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_IRQ)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_IRQ)),
++	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_SDA)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_SDA)));
++	if (!tp_power_on()) {
++		goto out;
++	}
++	if (!tp_clocks()) {
++		goto out;
++	}
++	tp_gpio(TP_PIN_SDA, 1, 0, 0, false, false); /* qup17, 2 mA, no pull */
++	tp_gpio(TP_PIN_SCL, 1, 0, 0, false, false);
++	if (!tp_se_init()) {
++		goto out;
++	}
++	st.probing = true;
++	bool ok = tp_probe_chip();
++	st.probing = false;
++	if (!ok || st.dead) {
++		goto out;
++	}
++	printf("SWEET S3706: S3706 online, data=%#x, %ux%u, poll=10ms\n",
++	    st.f12_data, TP_PANEL_W, TP_PANEL_H);
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		/* The attention line (idle high) says a report is ready; also
++		 * read every ~100 ms in case the line does not work as assumed. */
++		if (!(tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_IRQ)) & 1u) || (++ticks % 10u) == 0) {
++			int err = tp_poll_report();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET S3706: report err=%d irq=%#x seen=%#x\n",
++					    err, st.irq_last, st.irq_status);
++				}
++				if (errors == 10) {
++					tp_report(0, st.x, st.y); /* release after persistent bad reads */
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		tp_wait(10);
++	}
++	tp_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_s3706_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("s3706", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET S3706: disabled (s3706=1 enables the PCLM10 touch)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(tp_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET S3706: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 3c9e99d..05fdddf 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_fts_init(void);
++extern void sweet_s3706_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+@@ -669,6 +670,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_fts_init();
++	sweet_s3706_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index f876fb0..a5743ca 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -359,7 +359,12 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ #define SWEET_TOUCH_EDGE_PX 48
+ extern "C" int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
+ 
+-/* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
++/* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h).
++ * PCLM10's S3706 reports 1080x2400 (vendor DTBO panel-coords), so the
++ * panel size becomes a boot-arg (sweethid_panel_w/h); the defaults keep
++ * flame exactly as before. Everything derived (logical offsets, clamps,
++ * edge band) follows the runtime size, which keeps the touch mapping the
++ * exact inverse of the display copy for either panel. */
+ #define SWEET_PANEL_W 1080
+ #define SWEET_PANEL_H 2280
+ class SweetHIDTouch : public IOHIDEventService {
+@@ -374,6 +379,7 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH;
+ 	uint32_t fCornerRadius;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+@@ -441,10 +447,18 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? SWEET_PANEL_H : 2436;
+-	fOffX = (fLogicalW - SWEET_PANEL_W) / 2;
+-	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
++	fPanelW = SWEET_PANEL_W;
++	fPanelH = SWEET_PANEL_H;
++	PE_parse_boot_argn("sweethid_panel_w", &fPanelW, sizeof(fPanelW));
++	PE_parse_boot_argn("sweethid_panel_h", &fPanelH, sizeof(fPanelH));
++	if (fPanelW < 32 || fPanelW > 8192 || fPanelH < 32 || fPanelH > 8192) {
++		fPanelW = SWEET_PANEL_W;
++		fPanelH = SWEET_PANEL_H;
++	}
++	fLogicalW = native ? fPanelW : 1125;
++	fLogicalH = native ? fPanelH : 2436;
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
+ 	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
+ 	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
+@@ -456,7 +470,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered\n");
++	IOLog("SWEET HID: touch registered, panel %dx%d\n", fPanelW, fPanelH);
+ 	return true;
+ }
+ 
+@@ -470,8 +484,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > SWEET_PANEL_W - 1 ? SWEET_PANEL_W - 1 : x);
+-	y = y < 0 ? 0 : (y > SWEET_PANEL_H - 1 ? SWEET_PANEL_H - 1 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -479,8 +493,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	int fitW = sweet_display_fit_w, fitH = sweet_display_fit_h;
+ 	if (fitW <= 0 || fitH <= 0) {
+ 		fitX = fitY = 0;
+-		fitW = SWEET_PANEL_W;
+-		fitH = SWEET_PANEL_H;
++		fitW = fPanelW;
++		fitH = fPanelH;
+ 	}
+ 	/*
+ 	 * No contact starts in a masked corner of the image (SweetDisplayMask.h);
+@@ -514,8 +528,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > SWEET_PANEL_W - 1 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
