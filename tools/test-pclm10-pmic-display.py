@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0166-flame-pclm10-framebuffer-map-timed.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0167-flame-pclm10-touch-swipe-automation.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -160,6 +160,14 @@ int main(void) {
         self.assertIn("static const uint64_t marks[] = {75, 150, 210};", src)
         self.assertIn("elapsed_ns >= marks[i] * 1000000000ULL", src)
         self.assertNotIn("if (slot >= 3)", src)
+
+    def test_synthetic_swipe_is_opt_in(self):
+        src = (ACTIVE_SOURCE / "bsd/dev/sweet_s3706.c").read_text(encoding="utf-8")
+        fn = extract_function(src, "tp_swipe")
+        self.assertIn("sweet_hid_touch(0, 1, 540", fn)
+        self.assertIn("sweet_hid_touch(0, 0, 540", fn)
+        self.assertIn("PE_parse_boot_argn(\"s3706swipe\"", src)
+        self.assertIn("++sw_tick >= swipe_s * 100u", src)
 
     def test_touch_gpio_register_values(self):
         src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
@@ -313,7 +321,7 @@ int main() {
         spec.loader.exec_module(module)
         self.assertEqual(sorted(set(module.args("unixnu-p4-touch-pmicdiag.toml")) -
                                 set(module.args("unixnu-p4-touch.toml"))),
-                         ["sweetfb_compare=1", "sweetfb_map=1"])
+                         ["s3706swipe=50", "sweetfb_compare=1", "sweetfb_map=1"])
 
     @unittest.skipIf(SOURCE_FLAG, "requires the board's DT and on-device log")
     def test_identifies_cpu_center_crop_without_claiming_correct_output(self):
@@ -333,10 +341,10 @@ int main() {
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0165-r42503810275/xnu/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0165-r42503810275/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0165-r42503810275/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0165-r42503810275/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0166-r42505318738/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0166-r42505318738/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0166-r42505318738/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0166-r42505318738/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:

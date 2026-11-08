@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 03a727a..07b87ff 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -1266,6 +1266,19 @@ tp_poll_report(void)
+ 	return 0;
+ }
+ 
++static void
++tp_swipe(void)
++{
++	/* Synthetic bottom-to-top swipe through the same HID path as real
++	 * touches; opt-in with s3706swipe=N seconds between swipes. */
++	for (unsigned i = 0; i < 25; i++) {
++		sweet_hid_touch(0, 1, 540, 2250 - (int)i * 60);
++		tp_wait(10);
++	}
++	sweet_hid_touch(0, 0, 540, 750);
++	printf("SWEET S3706: synthetic swipe for unattended UI capture\n");
++}
++
+ static void
+ tp_thread(void *arg, wait_result_t result)
+ {
+@@ -1276,6 +1289,8 @@ tp_thread(void *arg, wait_result_t result)
+ 	 * hangs the SoC, the log channel and the UI got there first. */
+ 	(void)PE_parse_boot_argn("s3706delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("s3706log", &st.log, sizeof(st.log));
++	unsigned swipe_s = 0;
++	(void)PE_parse_boot_argn("s3706swipe", &swipe_s, sizeof(swipe_s));
+ 	printf("SWEET S3706: starting in %u s\n", delay_s);
+ 	tp_wait(delay_s * 1000u);
+ 	printf("SWEET S3706: mapping GCC/TLMM/SE17\n");
+@@ -1318,8 +1333,12 @@ tp_thread(void *arg, wait_result_t result)
+ 	}
+ 	printf("SWEET S3706: S3706 online, data=%#x, %ux%u, poll=10ms\n",
+ 	    st.f12_data, TP_PANEL_W, TP_PANEL_H);
+-	unsigned errors = 0, ticks = 0;
++	unsigned errors = 0, ticks = 0, sw_tick = 0;
+ 	while (!st.dead) {
++		if (swipe_s && ++sw_tick >= swipe_s * 100u) {
++			sw_tick = 0;
++			tp_swipe();
++		}
+ 		/* The attention line (idle high) says a report is ready; also
+ 		 * read every ~100 ms in case the line does not work as assumed. */
+ 		if (!(tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_IRQ)) & 1u) || (++ticks % 10u) == 0) {
