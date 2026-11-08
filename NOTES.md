@@ -69,8 +69,8 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 - PCLM10 fork 0162: first touch 1.8 V write. A16 register read showed
   PM8150L GPIO5 owned by EE0, valid LV GPIO, but left input/pull-down.
   The patch writes only its register block after type/subtype/owner checks,
-  in vendor pinctrl order; display comparison sampling widened. Hardware
-  result pending.
+  in vendor pinctrl order; display comparison sampling widened. **Verified
+  on hardware: touch online and usable, home screen renders normally.**
 - PCLM10 fork 0161: read-only PM8150L GPIO5/APID diagnostics and opt-in
   CPU framebuffer source/panel comparison. Confirmed on hardware that
   GPIO5 is an owned LV input with pull-down; touch still failed. Display

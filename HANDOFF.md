@@ -22,7 +22,18 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
   register block, owner 0, and type/subtype 0x10/0x10; writes follow the
   vendor pinctrl config order with master enable last. The PON writer and
   all other PMIC access are unchanged. Display compare now keeps 12
-  samples every third eligible frame. Hardware result pending.
+  samples every third eligible frame.
+- **0162 hardware result (kernel 0162, capture
+  `work/usb-log-20261109-003145/`): touch is online and usable.** The
+  PMIC write returned 0; readback showed mode 1, out-source 0x80, enable
+  0x80, pull 5. I2C idle levels became 1/1, page select succeeded, and
+  `S3706 online` was followed by a continuous coordinate stream. The user
+  confirmed touch works.
+- Display: all CPU compare samples from the 0162 boot reported zero
+  mismatches, and the user confirmed the home screen renders normally.
+  The lock-screen red/blue appearance comes from iOS's default gradient
+  poster (`CollectionsPoster`/`GradientPosterExtension`), not from the
+  display driver; changing it is userland wallpaper/provisioning work.
 
 ### PCLM10 0161: PMIC GPIO identity and display diagnostics (2026-11-08)
 
