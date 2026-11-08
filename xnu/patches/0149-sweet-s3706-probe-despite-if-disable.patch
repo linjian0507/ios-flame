@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 91b315b..c18905f 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -381,38 +381,28 @@ tp_se_init(void)
+ {
+ 	uint32_t fw = tp_rd(st.se, SE_FW);
+ 	uint32_t tx = tp_rd(st.se, SE_HW_TX), rx = tp_rd(st.se, SE_HW_RX);
+-	printf("SWEET S3706: se17 fw=%#x proto=%u status=%#x tx=%#x rx=%#x hwid=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, tp_rd(st.se, SE_STATUS), tx, rx, tp_rd(st.se, 0x000));
+-	if (tp_rd(st.se, 0x64) & 1u) {
+-		/*
+-		 * PCLM10's firmware configured this SE for GSI (GPI DMA)
+-		 * transfers, so its FIFO interface is disabled: 0x64 is
+-		 * GENI_IF_DISABLE_RO, bit 0 FIFO_IF_DISABLE (vendor
+-		 * geni-se.h), and the vendor DT wires gpi_dma2 to this
+-		 * bus. The vendor driver clears the writable
+-		 * SE_FIFO_IF_DISABLE (0x2008) bit when it wants FIFO mode
+-		 * (qcom-geni-se.c, firmware-load path); do exactly that
+-		 * and re-read the read-only status. If the interface does
+-		 * not come up, the gate below stops us with the evidence.
+-		 */
+-		uint32_t dis = tp_rd(st.se, 0x64), before = tp_rd(st.se, 0x2008);
+-		tp_wr(st.se, 0x2008, before & ~1u);
+-		printf("SWEET S3706: fifo if-disable set (64=%#x 2008=%#x); cleared -> 2008=%#x 64=%#x\n",
+-		    dis, before, tp_rd(st.se, 0x2008), tp_rd(st.se, 0x64));
+-	}
++	printf("SWEET S3706: se17 fw=%#x proto=%u status=%#x ifdis=%#x tx=%#x rx=%#x hwid=%#x\n",
++	    fw, (fw >> 8) & 0xffu, tp_rd(st.se, SE_STATUS), tp_rd(st.se, 0x64),
++	    tx, rx, tp_rd(st.se, 0x000));
+ 	/*
+-	 * FIFO depth is a property of the SE, not of the bus: this SE17
+-	 * reports a 4-word RX FIFO (0x20104900), flame's SE7 reported 32.
+-	 * Linux's geni-i2c accepts whatever depth the SE reports and relies
+-	 * on hardware flow control (clock stretching) while the FIFO drains;
+-	 * tp_msg_run drains word by word, so a shallow RX FIFO is fine.
+-	 * Keep the firmware-protocol and FIFO-mode gates and require only
+-	 * that both FIFOs exist.
++	 * 0x64 (GENI_IF_DISABLE_RO, bit 0 = FIFO_IF_DISABLE, vendor
++	 * geni-se.h) is set on this SE: PCLM10's firmware declared the
++	 * FIFO interface disabled - the vendor i2c driver switches to GPI
++	 * DMA on that bit, and its DT wires gpi_dma2 to this bus. It is
++	 * read-only here: the writable SE_FIFO_IF_DISABLE (0x2008) that
++	 * newer QUP generations toggle does not exist on SM8150 (zero
++	 * hits in the vendor 5.4 tree), and the round that first touched
++	 * it hung its thread on the access. The vendor 5.4 driver selects
++	 * FIFO mode by clearing SE_GENI_DMA_MODE_EN (0x258), which
++	 * tp_se_init already does, so treat the bit as information and
++	 * let the probe transfers themselves arbitrate: if the FIFO path
++	 * is really dead, their error log names the failure mode and the
++	 * next step is GSI.
+ 	 */
+-	if (((fw >> 8) & 0xffu) != 3u || (tp_rd(st.se, 0x64) & 1u) ||
++	if (((fw >> 8) & 0xffu) != 3u ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) < 1u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("SWEET S3706: need ABL-loaded I2C firmware in FIFO mode; stopping (tx=%u/%u rx=%u/%u words)\n",
++		printf("SWEET S3706: need ABL-loaded I2C firmware and usable FIFOs; stopping (tx=%u/%u rx=%u/%u words)\n",
+ 		    (tx >> 24) & 0x3fu, (tx >> 16) & 0x3fu,
+ 		    (rx >> 24) & 0x3fu, (rx >> 16) & 0x3fu);
+ 		return false;
