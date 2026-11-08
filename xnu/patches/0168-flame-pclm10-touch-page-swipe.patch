@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 07b87ff..ed8821f 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -1267,16 +1267,24 @@ tp_poll_report(void)
+ }
+ 
+ static void
+-tp_swipe(void)
++tp_swipe(int dir)
+ {
+-	/* Synthetic bottom-to-top swipe through the same HID path as real
+-	 * touches; opt-in with s3706swipe=N seconds between swipes. */
+-	for (unsigned i = 0; i < 25; i++) {
+-		sweet_hid_touch(0, 1, 540, 2250 - (int)i * 60);
+-		tp_wait(10);
++	/* dir 0: bottom-to-top unlock; dir 1: right-to-left page turn. */
++	if (dir == 0) {
++		for (unsigned i = 0; i < 25; i++) {
++			sweet_hid_touch(0, 1, 540, 2250 - (int)i * 60);
++			tp_wait(10);
++		}
++		sweet_hid_touch(0, 0, 540, 750);
++	} else {
++		for (unsigned i = 0; i < 25; i++) {
++			sweet_hid_touch(0, 1, 950 - (int)i * 32, 1200);
++			tp_wait(10);
++		}
++		sweet_hid_touch(0, 0, 150, 1200);
+ 	}
+-	sweet_hid_touch(0, 0, 540, 750);
+-	printf("SWEET S3706: synthetic swipe for unattended UI capture\n");
++	printf("SWEET S3706: synthetic %s swipe for unattended UI capture\n",
++	    dir == 0 ? "unlock" : "page");
+ }
+ 
+ static void
+@@ -1333,11 +1341,11 @@ tp_thread(void *arg, wait_result_t result)
+ 	}
+ 	printf("SWEET S3706: S3706 online, data=%#x, %ux%u, poll=10ms\n",
+ 	    st.f12_data, TP_PANEL_W, TP_PANEL_H);
+-	unsigned errors = 0, ticks = 0, sw_tick = 0;
++	unsigned errors = 0, ticks = 0, sw_tick = 0, sw_count = 0;
+ 	while (!st.dead) {
+ 		if (swipe_s && ++sw_tick >= swipe_s * 100u) {
+ 			sw_tick = 0;
+-			tp_swipe();
++			tp_swipe(sw_count++ == 0 ? 0 : 1);
+ 		}
+ 		/* The attention line (idle high) says a report is ready; also
+ 		 * read every ~100 ms in case the line does not work as assumed. */

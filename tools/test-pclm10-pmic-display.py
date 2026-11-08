@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0167-flame-pclm10-touch-swipe-automation.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0168-flame-pclm10-touch-page-swipe.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -166,8 +166,10 @@ int main(void) {
         fn = extract_function(src, "tp_swipe")
         self.assertIn("sweet_hid_touch(0, 1, 540", fn)
         self.assertIn("sweet_hid_touch(0, 0, 540", fn)
+        self.assertIn("950 - (int)i * 32", fn)
         self.assertIn("PE_parse_boot_argn(\"s3706swipe\"", src)
         self.assertIn("++sw_tick >= swipe_s * 100u", src)
+        self.assertIn("tp_swipe(sw_count++ == 0 ? 0 : 1)", src)
 
     def test_touch_gpio_register_values(self):
         src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
@@ -341,10 +343,10 @@ int main() {
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0166-r42505318738/xnu/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0166-r42505318738/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0166-r42505318738/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0166-r42505318738/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0167-r42506900476/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0167-r42506900476/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0167-r42506900476/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0167-r42506900476/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:
