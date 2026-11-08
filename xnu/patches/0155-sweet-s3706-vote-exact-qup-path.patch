@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 61b2f7a..6684358 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -201,7 +201,10 @@ void sweet_s3706_init(void);
+  * works because ABL itself drove it and left its votes; the GPU
+  * driver proved both the need and the mechanism on this device
+  * (gpu_bus_vote raises MC0/SH0 through sweet_rpmh.c because nothing
+- * else does). Raise the TBU's segment the same way.
++ * else does). The next round printed the firmware's cmd-db: QUP0 is
++ * present, and the SM8150 interconnect graph places qhm_qup2 under
++ * it, followed by SN11, SN0, SH0 and MC0 on the exact path to DDR.
++ * Raise that chain with the same RPMh recipe.
+  */
+ #define AS_PA           0x15000000ULL
+ #define AS_SIZE         0x100000
+@@ -577,16 +580,18 @@ tp_tbu_power_cycle(void)
+  * (no fault anywhere), and never answered. The GPU driver proves the
+  * mechanism and the need on this device (gpu_bus_vote raises MC0/SH0
+  * because nothing else does); the TBU's own segment is the anoc_2
+- * side. The RPMh resource name for it is not known here, so print
+- * the firmware's own resource table once, then ask for the plausible
+- * names at top level: a lookup miss is a harmless refusal, a hit
+- * raises the clock (RPMh takes the maximum of all votes, and the GPU
+- * already raised the memory-side ones).
++ * side. The last round printed the firmware's own cmd-db and removed
++ * the final ambiguity: QUP0 is the BCM that contains all three QUP
++ * masters, including qhm_qup2; the SM8150 interconnect topology then
++ * walks qhm_qup2 -> qnm_aggre2_noc -> qns_gemnoc_sf -> qns_llcc ->
++ * ebi, whose BCMs are QUP0, SN11, SN0, SH0 and MC0 respectively.
++ * Vote that exact chain at top level. RPMh takes the maximum of all
++ * clients' votes, so this cannot lower inherited bandwidth.
+  */
+ static void
+ tp_bus_vote(void)
+ {
+-	static const char *const names[] = { "MMC", "MF0", "MMO", "ANOC", "MMN" };
++	static const char *const names[] = { "QUP0", "SN11", "SN0", "SH0", "MC0" };
+ 	sweet_rpmh_dump_db();
+ 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+ 		uint32_t off = 0, val = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
