@@ -1,0 +1,106 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bc98b59..a4e4d60 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,6 +253,93 @@ AppleCLCD::start(IOService *provider)
+ 
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * Opt-in panel sampling (boot-arg sweetfb_sample=1): after a frame has
++ * been copied, read back what the panel is about to scan and report it.
++ * The lock screen renders colors the user says are wrong (red digits on
++ * a blue background); the bytes answer the question the screen cannot:
++ * if the sampled bytes already show the wrong colors, the UI rendered
++ * them (content bug); if the bytes are right, something downstream of
++ * the panel memory introduces them (format bug). Plane statistics are
++ * reported in memory byte order with no interpretation baked in, and
++ * two raw scanlines through the clock area give the exact words. Runs
++ * after presents 5/15/30/60/120 (the UI's first minutes); reads only.
++ */
++static void
++sweet_fb_sample_panel(uintptr_t pixels, uint32_t width, uint32_t height,
++    uint32_t row_bytes)
++{
++	static int on = -1;
++	if (on < 0) {
++		on = 0;
++		PE_parse_boot_argn("sweetfb_sample", &on, sizeof(on));
++	}
++	if (!on || pixels == 0 || width == 0 || height == 0) {
++		return;
++	}
++	static uint64_t presents;
++	static const uint64_t at[] = {5, 15, 30, 60, 120};
++	presents++;
++	for (unsigned slot = 0; slot < sizeof(at) / sizeof(at[0]); slot++) {
++		if (at[slot] != presents) {
++			continue;
++		}
++		uint32_t mn[4] = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
++		uint32_t mx[4] = {0, 0, 0, 0};
++		uint64_t sum[4] = {0, 0, 0, 0};
++		uint32_t n = 0;
++		for (uint32_t y = 0; y < height; y += 64) {
++			const volatile uint8_t *row =
++			    (const volatile uint8_t *)(pixels + (uint64_t)y * row_bytes);
++			for (uint32_t x = 0; x < width; x += 64) {
++				const volatile uint8_t *px = row + (size_t)x * 4;
++				for (int p = 0; p < 4; p++) {
++					uint32_t v = px[p];
++					if (v < mn[p]) {
++						mn[p] = v;
++					}
++					if (v > mx[p]) {
++						mx[p] = v;
++					}
++					sum[p] += v;
++				}
++				n++;
++			}
++		}
++		if (n == 0) {
++			return;
++		}
++		IOLog("SWEET FB: sample %u grid %u px planes min %u/%u/%u/%u max %u/%u/%u/%u mean %u/%u/%u/%u\n",
++		    slot, n, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
++		    (uint32_t)(sum[0] / n), (uint32_t)(sum[1] / n),
++		    (uint32_t)(sum[2] / n), (uint32_t)(sum[3] / n));
++		/*
++		 * Raw words along two lines through the clock (y at 30% and 42%
++		 * of the panel, x from 5% to 100% in 6% steps): 17 words, hex,
++		 * as stored in memory.
++		 */
++		static const char hexd[] = "0123456789abcdef";
++		static const uint32_t line_pct[] = {30, 42};
++		for (unsigned l = 0; l < sizeof(line_pct) / sizeof(line_pct[0]); l++) {
++			uint32_t y = (uint32_t)((uint64_t)height * line_pct[l] / 100);
++			char buf[17 * 9 + 1];
++			int pos = 0;
++			for (int i = 0; i < 17; i++) {
++				uint32_t x = (uint32_t)((uint64_t)width * (uint64_t)(5 + 6 * i) / 100);
++				uint32_t v = *(const volatile uint32_t *)
++				    (pixels + (uint64_t)y * row_bytes + (uint64_t)x * 4);
++				buf[pos++] = ' ';
++				for (int sh = 28; sh >= 0; sh -= 4) {
++					buf[pos++] = hexd[(v >> sh) & 0xf];
++				}
++			}
++			buf[pos] = 0;
++			IOLog("SWEET FB: sample %u line y=%u:%s\n", slot, y, buf);
++		}
++		return;
++	}
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -337,6 +424,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fStatPresentAbs += mach_absolute_time() - t0;
+ 		fb->fStatPresents++;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		sweet_fb_sample_panel(fb->fPixels, fb->fWidth, fb->fHeight, fb->fRowBytes);
+ 	}
+ }
+ 
