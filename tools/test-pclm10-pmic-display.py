@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0165-flame-pclm10-framebuffer-map-paced.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0166-flame-pclm10-framebuffer-map-timed.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -157,8 +157,9 @@ int main(void) {
         self.assertIn("SWEET FB MAP %u %u %s", emit)
         self.assertIn("++sweet_fb_map_tick < 2", emit)
         self.assertIn("sweet_fb_map_emit();", src)
-        self.assertIn("{5, 15, 30, 60, 120, 240}", src)
-        self.assertIn("if (slot >= 3)", src)
+        self.assertIn("static const uint64_t marks[] = {75, 150, 210};", src)
+        self.assertIn("elapsed_ns >= marks[i] * 1000000000ULL", src)
+        self.assertNotIn("if (slot >= 3)", src)
 
     def test_touch_gpio_register_values(self):
         src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
@@ -332,10 +333,10 @@ int main() {
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0164-r42503094288/xnu/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0164-r42503094288/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0164-r42503094288/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0164-r42503094288/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0165-r42503810275/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0165-r42503810275/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0165-r42503810275/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0165-r42503810275/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:

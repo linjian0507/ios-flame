@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d8b55b7..e84dbb4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -506,10 +506,6 @@ sweet_fb_sample_panel(uintptr_t pixels, uint32_t width, uint32_t height,
+ 			buf[pos] = 0;
+ 			IOLog("SWEET FB: sample %u line y=%u:%s\n", slot, y, buf);
+ 		}
+-		if (slot >= 3) {
+-			sweet_fb_dump_map((const uint8_t *)pixels, width, height,
+-			    row_bytes, slot);
+-		}
+ 		return;
+ 	}
+ }
+@@ -534,6 +530,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fNextVsync = now + fb->fVsyncAbs;
+ 	}
+ 	sender->wakeAtTime(fb->fNextVsync);
++	/*
++	 * Time-based panel maps, not present-count based: a static screen
++	 * presents rarely, so the old slots could fall past the 240 s
++	 * experiment window. Capture at ~86/161/221 s after the first vsync.
++	 */
++	static uint64_t map_start;
++	static unsigned map_marks;
++	static const uint64_t marks[] = {75, 150, 210};
++	if (map_start == 0) {
++		map_start = now;
++	}
++	uint64_t elapsed_ns = 0;
++	absolutetime_to_nanoseconds(now - map_start, &elapsed_ns);
++	for (unsigned i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
++		if (!(map_marks & (1u << i)) &&
++		    elapsed_ns >= marks[i] * 1000000000ULL) {
++			map_marks |= 1u << i;
++			sweet_fb_dump_map((const uint8_t *)fb->fPixels,
++			    fb->fWidth, fb->fHeight, fb->fRowBytes, i);
++		}
++	}
+ 	sweet_fb_map_emit();
+ 	if ((count % 300) == 0) {
+ 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
