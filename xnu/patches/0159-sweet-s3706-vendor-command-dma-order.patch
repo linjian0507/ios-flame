@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index 16b62fc..7a0bde6 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -27,7 +27,8 @@
+  * and the GENI/DMA event domains are enabled exactly as the vendor's
+  * geni_se_init(), even though completion is polled rather than IRQed;
+  * wrapper-domain and M-event enables use their distinct 0xe1c/0x614
+- * registers (never aliasing one another);
++ * registers (never aliasing one another); each transfer follows the
++ * vendor's length -> M_CMD0 -> DMA prep/final-LEN launch handshake;
+  * TLMM is reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+@@ -809,6 +810,19 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	tp_wr(st.se, SE_DTX_IRQ_CLR, 0xffffffffu);
+ 	tp_wr(st.se, SE_DRX_IRQ_CLR, 0xffffffffu);
+ 	uint32_t en = DMA_DONE_EN | DMA_EOT_EN | DMA_AHB_ERR_EN;
++	/* Vendor 4.19, SM8150 5.4 and current mainline all use the same
++	 * launch handshake: transaction length first, then M_CMD0 to arm
++	 * the protocol sequencer, then DMA prep with the channel's LEN as
++	 * the final write that releases the descriptor. A13 proved both M
++	 * and TX DMA became active with our reverse ordering but waited
++	 * forever on IOS=0; reproduce the hardware-defined handshake. */
++	if (nr) {
++		tp_wr(st.se, SE_RX_LEN, nr);
++	} else {
++		tp_wr(st.se, SE_TX_LEN, nt);
++	}
++	tp_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	if (nr) {
+ 		tp_wr(st.se, SE_DRX_IRQ_EN_SET, en);
+ 		tp_wr(st.se, SE_DRX_PTR_L, (uint32_t)pa);
+@@ -817,17 +831,13 @@ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 		 * buffer type bit. So just reset RX_ATTR". */
+ 		tp_wr(st.se, SE_DRX_ATTR, 0);
+ 		tp_wr(st.se, SE_DRX_LEN, nr);
+-		tp_wr(st.se, SE_RX_LEN, nr);
+ 	} else {
+ 		tp_wr(st.se, SE_DTX_IRQ_EN_SET, en);
+ 		tp_wr(st.se, SE_DTX_PTR_L, (uint32_t)pa);
+ 		tp_wr(st.se, SE_DTX_PTR_H, (uint32_t)(pa >> 32));
+ 		tp_wr(st.se, SE_DTX_ATTR, DMA_EOT_BUF);
+ 		tp_wr(st.se, SE_DTX_LEN, nt);
+-		tp_wr(st.se, SE_TX_LEN, nt);
+ 	}
+-	tp_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+-	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	if (st.probing) {
+ 		printf("SWEET S3706: launch cmd=%#x status=%#x wrapper-en=%#x m-en=%#x dtx-en=%#x drx-en=%#x\n",
+ 		    tp_rd(st.se, SE_CMD), tp_rd(st.se, SE_STATUS),
