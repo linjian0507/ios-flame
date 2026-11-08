@@ -1,0 +1,229 @@
+"""Offline checks for the PCLM10 PMIC/display diagnostic patch.
+
+The compiled host harnesses exercise the C read allowlist and the actual C++
+pixel comparison routine with fake buffers; they do not simulate phone MMIO.
+Run after generating 0161 and before publishing any image.
+"""
+import os
+import sys
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+import hashlib
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0161-flame-pclm10-pmic-display-diagnostics.patch"
+SOURCE_FLAG = "--source" in sys.argv
+
+
+def extract_function(source: str, name: str) -> str:
+    """Return an actual source function including its return-type line."""
+    at = source.index("\n" + name + "(") + 1
+    start = source.rfind("\n", 0, at - 1) + 1
+    left = source.index("{", at)
+    depth = 0
+    for i in range(left, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+    raise ValueError(f"unclosed function {name}")
+
+
+def source_root() -> Path:
+    """Use --source for CI's applied XNU tree; default to the local checkout."""
+    import sys
+    if "--source" in sys.argv:
+        index = sys.argv.index("--source")
+        source = Path(sys.argv[index + 1]).resolve()
+        del sys.argv[index:index + 2]
+        return source
+    return SOURCE
+
+
+ACTIVE_SOURCE = source_root()
+
+
+def compile_and_run(cpp: bool, code: str) -> None:
+    compiler = shutil.which("clang++" if cpp else "clang")
+    if not compiler:
+        raise unittest.SkipTest("clang/clang++ not available")
+    preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
+    parent = str(preferred) if preferred.is_dir() else None
+    with tempfile.TemporaryDirectory(prefix="pclm10-tests-", dir=parent) as tmp:
+        source = Path(tmp) / ("test.cpp" if cpp else "test.c")
+        binary = Path(tmp) / "test"
+        source.write_text(code, encoding="utf-8")
+        subprocess.run([compiler, "-std=c++17" if cpp else "-std=c11", "-Wall",
+                        "-Wextra", "-Werror", str(source), "-o", str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
+class PMICDisplayTests(unittest.TestCase):
+    @unittest.skipIf(SOURCE_FLAG, "local private DTBO not part of CI checkout")
+    def test_overlay_resolves_local_pmic_gpio(self):
+        overlay = (ROOT / "dtbo-overlay-0.dts").read_text(encoding="utf-8")
+        self.assertIn('enable1v8_gpio = <0x63 0x05 0x01>;', overlay)
+        controller = overlay[overlay.index('qcom,pm8150l@4 {'):overlay.index('qcom,pm8150l@5 {')]
+        self.assertIn('compatible = "qcom,spmi-gpio";', controller)
+        self.assertIn('reg = <0xc000 0xc00>;', controller)
+        self.assertIn('phandle = <0x63>;', controller)
+        self.assertIn('touchpanel_1v8_enable', controller)
+        self.assertIn('pins = "gpio5";', controller)
+        self.assertIn('enable1v8_gpio = <0x00>;', overlay[overlay.index('__local_fixups__ {'):])
+
+    def test_read_allowlist_exhaustive(self):
+        src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
+        fn = extract_function(src, "sp_read_allowed")
+        harness = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+''' + fn + r'''
+int main(void) {
+    const unsigned base[] = {0x08, 0x10, 0x11, 0x12, 0x13, 0x48, 0x60};
+    for (unsigned sid = 0; sid < 16; sid++) {
+        for (unsigned addr = 0; addr < 0x10000; addr++) {
+            bool expect = false;
+            for (unsigned i = 0; i < sizeof(base)/sizeof(base[0]); i++)
+                if (sid == 0 && (addr >> 8) == base[i]) expect = true;
+            unsigned off = addr & 255;
+            if (sid == 4 && (addr >> 8) == 0xc4 &&
+                (off == 4 || off == 5 || off == 0x10 || (off >= 0x40 && off <= 0x46)))
+                expect = true;
+            if (sp_read_allowed(sid, addr) != expect) {
+                fprintf(stderr, "unexpected sid=%u addr=%x\n", sid, addr); return 1;
+            }
+        }
+    }
+    if (sp_read_allowed(0, 0x10008) || sp_read_allowed(4, 0x1c404)) return 2;
+    return 0;
+}
+'''
+        compile_and_run(False, harness)
+
+    def test_write_path_not_extended(self):
+        now = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
+        writer = extract_function(now, "sweet_spmi_write")
+        self.assertIn("sid != 0", writer)
+        self.assertIn("peripheral != 0x08", writer)
+        owner = extract_function(now, "sweet_spmi_touch_gpio_owner")
+        self.assertIn("IOLockLock(sp_lock)", owner)
+        self.assertIn("(4u << 8) | 0xc4u", owner)
+        self.assertNotIn("SP_CHNLS_PA", owner)
+        touch = (ACTIVE_SOURCE / "bsd/dev/sweet_s3706.c").read_text(encoding="utf-8")
+        self.assertNotIn("TP_PIN_EN1V8", touch)
+        self.assertNotIn("sweet_spmi_write(", touch)
+
+    @unittest.skipIf(SOURCE_FLAG, "original local CI build tree not present in CI")
+    def test_original_writer_byte_identical(self):
+        now = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
+        before = (ROOT / "work/buildtree-0149/xnu/bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
+        self.assertEqual(extract_function(now, "sweet_spmi_write"),
+                         extract_function(before, "sweet_spmi_write"))
+
+    @unittest.skipIf(SOURCE_FLAG, "local CI preimage hashes not present in CI checkout")
+    def test_ci_preimage_hashes(self):
+        expected = {
+            "bsd/dev/sweet_s3706.c": "50e99f76c02ef2edee813583c19b9f43959ed747eab76d94a175a4638ddd9c76",
+            "bsd/dev/sweet_spmi.c": "6ffa6a1da6071deeb195968ef7740236242a7810b1d85aa03b49cc794c07f6be",
+            "bsd/dev/sweet_spmi.h": "555d0e4500320b0c3c8df36d498fc4262e70a36eb67f30e009e3be32a0554303",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": "b1840e07a1baf6606c25ce70817ca961fbfa6975bdfe060f25f9519787a705d0",
+        }
+        # Work/buildtree-0160 was edited after extracting the exact CI files;
+        # use the immutable baseline committed in the local XNU checkout.
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git not available")
+        for path, digest in expected.items():
+            result = subprocess.run([git, "show", f"HEAD~1:{path}"], cwd=SOURCE,
+                                    check=True, stdout=subprocess.PIPE)
+            self.assertEqual(hashlib.sha256(result.stdout).hexdigest(), digest, path)
+
+    def test_display_comparison_against_synthetic_frames(self):
+        src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        fn = extract_function(src, "sweet_fb_compare_cpu")
+        harness = r'''
+#include <algorithm>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+static char last_log[1024];
+static void PE_parse_boot_argn(const char *, int *v, unsigned long) { *v = 1; }
+static void IOLog(const char *format, ...) {
+    va_list a; va_start(a, format); vsnprintf(last_log, sizeof(last_log), format, a); va_end(a);
+}
+''' + fn + r'''
+int main() {
+    const uint32_t W=1080, H=2400, SW=1125, SH=2436, STRIDE=4608;
+    std::vector<uint8_t> source((size_t)STRIDE*SH), panel((size_t)W*H*4);
+    for (uint32_t y=0; y<SH; y++) for (uint32_t x=0; x<SW; x++) {
+        uint8_t *p=&source[(size_t)y*STRIDE+4*x];
+        p[0]=197; p[1]=131; p[2]=13; p[3]=255;
+    }
+    // A small foreground pattern makes this a nonuniform frame; x=22
+    // and y=594 align with the diagnostic's sparse grid after cropping.
+    for (uint32_t y=594; y<626; y++) for (uint32_t x=22; x<54; x++) {
+        uint8_t *p=&source[(size_t)y*STRIDE+4*x]; p[0]=80; p[1]=20; p[2]=200;
+    }
+    for (uint32_t y=0; y<H; y++)
+        memcpy(&panel[(size_t)y*W*4], &source[(size_t)(y+18)*STRIDE+22*4], W*4);
+    const auto original=panel;
+    sweet_fb_compare_cpu(source.data(), panel.data(), STRIDE, W*4,
+                         22,18,0,0,W,H,W,H,20);
+    if (!strstr(last_log,"mismatches=0") || !strstr(last_log,"crop=22,18") || panel!=original) return 1;
+    for (uint32_t y=0; y<H; y++) for (uint32_t x=0; x<W; x++) {
+        uint8_t *p=&panel[((size_t)y*W+x)*4]; std::swap(p[0],p[2]);
+    }
+    const auto altered=panel;
+    for (int i=0; i<15; i++)
+        sweet_fb_compare_cpu(source.data(), panel.data(), STRIDE, W*4,
+                             22,18,0,0,W,H,W,H,20);
+    if (strstr(last_log,"mismatches=0") || strstr(last_log,"rb-swapped=0") || panel!=altered) return 2;
+    return 0;
+}
+'''
+        compile_and_run(True, harness)
+
+    @unittest.skipIf(SOURCE_FLAG, "local PCLM10 profiles not part of CI checkout")
+    def test_profile_is_one_diagnostic_argument(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("isolation", ROOT / "scripts/test_pclm10_driver_isolation.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.args("unixnu-p4-touch-pmicdiag.toml"),
+                         module.args("unixnu-p4-touch.toml") + ["sweetfb_compare=1"])
+
+    @unittest.skipIf(SOURCE_FLAG, "local CI preimage not present in CI checkout")
+    def test_patch_applies_to_exact_ci_sources(self):
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git not available")
+        originals = {
+            "bsd/dev/sweet_s3706.c": ROOT / "work/patch-0160/post/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0149/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0149/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0144/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
+        }
+        preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
+        with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:
+            root = Path(tmp)
+            for relative, original in originals.items():
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, dest)
+            subprocess.run([git, "apply", "--check", str(PATCH)], cwd=root, check=True)
+            subprocess.run([git, "apply", str(PATCH)], cwd=root, check=True)
+            for relative in originals:
+                self.assertEqual((root / relative).read_bytes(), (SOURCE / relative).read_bytes(), relative)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -66,6 +66,8 @@ written to the alt ramoops region via /dev/access-ramoops did not survive reboot
 
 ## Flame patches
 
+- PCLM10 fork 0161: stop treating SoC GPIO5 as the panel 1.8 V enable; add bounded read-only PM8150L GPIO5/APID diagnostics and opt-in CPU framebuffer source/panel comparison. Both touch and display fixes remain unverified on hardware.
+
 - PCLM10 fork 0137: opt-in `sweetresetdiag=1` final-action reset gate (leave
   panic notifications intact), record reboot PID/name/howto/caller, and
   `sweetdiagpanic=1/2` offline controls. Replaces flawed 0134/0136 broad stops;

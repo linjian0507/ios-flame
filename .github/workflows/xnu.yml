@@ -79,6 +79,9 @@ jobs:
           # build.sh may skip malformed patches and still return success.
           # Check the resulting source and compile the reset policy separately.
           python3 tools/test-reset-diagnostics.py --source dxb/xnu
+          # A successful build is not enough if patch application was skipped.
+          # Exercise the applied PCLM10 SPMI allowlist and framebuffer diagnostic.
+          python3 tools/test-pclm10-pmic-display.py --source dxb/xnu
           KERNEL=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
           test -f "$KERNEL"
           strings -a "$KERNEL" > reset-diag-strings.txt
@@ -86,6 +89,8 @@ jobs:
           grep -F 'SWEET RESET DIAG: intentional self-test panic' reset-diag-strings.txt
           grep -F 'SWEET RESET DIAG: terminal type=' reset-diag-strings.txt
           grep -F 'SWEET RESET DIAG: reboot pid=' reset-diag-strings.txt
+          grep -F 'PM8150L GPIO5 sid=4 peripheral=0xc4' reset-diag-strings.txt
+          grep -F 'SWEET FB: compare %u CPU source crop=' reset-diag-strings.txt
           if grep -F 'SWEET HALT: PEHaltRestartInternal' reset-diag-strings.txt; then
             echo 'obsolete broad panic gate is still present' >&2
             exit 1

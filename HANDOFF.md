@@ -5,6 +5,30 @@ test loop, bootloader rules) and `docs/ios-sweet/NOTES.md` (history of every ker
 
 ## Start here (next session)
 
+### PCLM10 0161: PMIC GPIO identity and display diagnostics (2026-11-08)
+
+- Observed in the locally decoded board overlay: the S3706 `enable1v8_gpio`
+  uses an overlay-local phandle to PM8150L's SPMI GPIO controller, GPIO5;
+  the previous touch driver instead drove SoC TLMM GPIO5. Vendor GPIO
+  indexing maps this to SID 4 peripheral `0xc4`; neither its live subtype,
+  inherited state, nor APID owner has been observed yet.
+- A15 / kernel 0160: S3706 page-select timed out; its GPIO bus recovery
+  reported SDA/SCL `0/0` before and after attempted pulses. This does not
+  prove a physical short or that the 1.8 V enable is low.
+- Kernel patch 0161 removes the erroneous SoC GPIO5 writes and reads only
+  PM8150L GPIO5 type/subtype/status/config plus APID owner through the
+  existing serialized observer. It adds no PMIC write path; whether that
+  rail can be enabled is a later hardware-dependent decision.
+- The A15 logs show 1125x2436 BGRA source surfaces and a 1080x2400 panel;
+  the CPU fallback crops rather than scales. The red/blue framebuffer
+  samples do not establish correct output. `sweetfb_compare=1` adds a
+  bounded source/panel memory comparison, not a rendering fix.
+- Planned diagnostic boot arguments are the PCLM10 touch profile with
+  `sweetreboot=240 sweetfb_sample=1 s3706=1 sweetfb_compare=1`; serial
+  CDC-ACM logging remains enabled. Host tests cover the SPMI read allowlist,
+  no broadened write path, source/panel synthetic frames, and patch apply.
+  Hardware results, touch reports and display correctness are pending.
+
 ### PCLM10 0137 validated offline, first diagnostic phone boot pending (2026-11-08 00:29)
 
 - Corrected CI `42389009193` passed build and applied-diagnostic checks.

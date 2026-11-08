@@ -1,0 +1,287 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index e3e510e..53e1fdd 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -4,8 +4,8 @@
+  *
+  * Sources: the vendor driver for this exact chip and panel (kept in this
+  * project at work/ref/synaptics_drivers_s3706.c), the PCLM10 DTBO
+- * (synaptics19081@20: address 0x20, reset GPIO 54, IRQ GPIO 122, 1.8 V
+- * enable GPIO 5, AVDD 3.0 V, 1080x2400 panel, 10 fingers), and the
++ * (synaptics19081@20: address 0x20, reset TLMM GPIO 54, IRQ TLMM GPIO
++ * 122, 1.8 V enable PM8150L GPIO5, AVDD 3.0 V, 1080x2400 panel), and the
+  * SM8150 clock driver (wrap2 s_ahb/m_ahb/SE0 APCS votes 0x52014 bits
+  * 1/2/4, branch CRs 0x1e004/0x1e008/0x1e144, RCG 0x1e148 = XO/1). The
+  * IC keeps its firmware and configuration in flash; this driver only
+@@ -51,6 +51,7 @@
+ #include <vm/vm_kern.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* as sweet_ufs.c: this build tree does not expose the declaration */
+@@ -74,7 +75,6 @@ void sweet_s3706_init(void);
+ #define TP_RCG         0x1e148u        /* gcc_qupv3_wrap2_s0_clk_src */
+ #define TP_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TP_GPIO_IO(n)  (TP_GPIO_CFG(n) + 4u)
+-#define TP_PIN_EN1V8   5               /* 1.8 V enable, driven high (vendor) */
+ #define TP_PIN_RESET   54              /* RES#, active low */
+ #define TP_PIN_SDA     55              /* qup17 = function 1 */
+ #define TP_PIN_SCL     56
+@@ -1090,20 +1090,52 @@ tp_se_init(void)
+ 	return true;
+ }
+ 
++/* Read the exact PM8150L GPIO5 block named by the local overlay phandle.
++ * The vendor driver numbers PMIC GPIOs from one, so GPIO5 is peripheral
++ * 0xc400 on SID 4. Type/subtype and APID ownership must be observed before
++ * choosing a write recipe. Reads and owner lookup share the SPMI lock. */
++static void
++tp_pmic_gpio_diagnostic(void)
++{
++	static const uint16_t addr[] = {
++		0xc404, 0xc405, 0xc410, 0xc440, 0xc441, 0xc442,
++		0xc443, 0xc444, 0xc445, 0xc446,
++	};
++	unsigned apid = 0, owner = 0;
++	int rc = sweet_spmi_touch_gpio_owner(&apid, &owner);
++	if (rc) {
++		printf("SWEET S3706: PM8150L GPIO5 APID unavailable; read-only diagnosis stopped\n");
++		return;
++	}
++	printf("SWEET S3706: PM8150L GPIO5 sid=4 peripheral=0xc4 apid=%u owner=%u (read-only)\n",
++	    apid, owner);
++	for (unsigned i = 0; i < sizeof(addr) / sizeof(addr[0]); ++i) {
++		uint8_t value = 0;
++		rc = sweet_spmi_read(4, addr[i], &value);
++		printf("SWEET S3706: PM8150L GPIO5 reg=%#x rc=%d value=%#x\n",
++		    addr[i], rc, value);
++		if (rc) {
++			break; /* in particular, never reuse a poisoned APID */
++		}
++	}
++}
++
+ /* Vendor power_control + reset, in physical levels: AVDD, 1.8 V enable high,
+  * 10 ms, release RES#, 80 ms boot. Keep RES# asserted while rails settle. */
+ static bool
+ tp_power_on(void)
+ {
++	/* Do not manipulate SoC TLMM GPIO5: it is not this panel's enable.
++	 * The inherited PMIC state is diagnostic only until its subtype and
++	 * arbiter ownership are verified; this is not a 1.8 V rail fix. */
++	tp_pmic_gpio_diagnostic();
+ 	tp_gpio(TP_PIN_RESET, 0, 0, 0, true, false);
+-	tp_gpio(TP_PIN_EN1V8, 0, 0, 0, true, false);
+ 	tp_gpio(TP_PIN_IRQ, 0, 3, 3, false, false); /* input, 8 mA, pull-up */
+ 	int err = sweet_rpmh_vreg_enable("ldoa17", 3000); /* DTBO vdd_2v8 3.0 V */
+ 	if (err) {
+ 		printf("SWEET S3706: LDO-A17 RPMh enable failed %d; stopping\n", err);
+ 		return false;
+ 	}
+-	tp_gpio(TP_PIN_EN1V8, 0, 0, 0, true, true);
+ 	tp_wait(10); /* POWEWRUP_TO_RESET_TIME */
+ 	tp_gpio(TP_PIN_RESET, 0, 0, 0, true, true);
+ 	tp_wait(80); /* RESET_TO_NORMAL_TIME */
+@@ -1252,8 +1284,7 @@ tp_thread(void *arg, wait_result_t result)
+ 	tp_smmu_reset_stale(); /* a stale fault record stalls the bank */
+ 	tp_tbu_power_cycle();  /* the domain is the vendor's TBU reset */
+ 	tp_bus_vote();         /* the TBU's NoC path: the vendor's own vote */
+-	printf("SWEET S3706: TLMM cfg/io en=%#x/%#x reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
+-	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_EN1V8)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_EN1V8)),
++	printf("SWEET S3706: TLMM cfg/io reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_RESET)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_RESET)),
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_IRQ)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_IRQ)),
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_SDA)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_SDA)));
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 2779edb..d1f6702 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -86,19 +86,35 @@ sweet_spmi_init(void)
+ 	return 0;
+ }
+ 
++/* Kept separate so the permitted read-only range can be tested on a host. */
++static bool
++sp_read_allowed(unsigned sid, unsigned addr)
++{
++	/* Existing SID 0 reads plus read-only diagnostics for the PCLM10
++	 * touch enable GPIO: PM8150L SID 4, physical gpio5 at 0xc400. */
++	if (addr > 0xffffu) {
++		return false;
++	}
++	unsigned peripheral = addr >> 8;
++	bool base_read = sid == 0 &&
++	    (peripheral == 0x08 || peripheral == 0x10 || peripheral == 0x11 ||
++	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48 ||
++	    peripheral == 0x60);
++	bool touch_gpio_read = sid == 4 && peripheral == 0xc4 &&
++	    ((addr & 0xffu) == 0x04u || (addr & 0xffu) == 0x05u ||
++	    (addr & 0xffu) == 0x10u ||
++	    ((addr & 0xffu) >= 0x40u && (addr & 0xffu) <= 0x46u));
++	return base_read || touch_gpio_read;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks, PON (0x08) and the RTC (0x60); keys retain their own lanes. */
+-	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x08 && peripheral != 0x10 && peripheral != 0x11 &&
+-	    peripheral != 0x12 && peripheral != 0x13 && peripheral != 0x48 &&
+-	    peripheral != 0x60)) {
++	if (!sp_ready || !out || !sp_read_allowed(sid, addr)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+@@ -128,6 +144,26 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	return -1;
+ }
+ 
++/* Read-only owner query for the single PM8150L GPIO used by the PCLM10
++ * touch panel. This never maps or submits to the write channel. */
++int
++sweet_spmi_touch_gpio_owner(unsigned *apid_out, unsigned *owner_out)
++{
++	if (!sp_ready || !apid_out || !owner_out) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((4u << 8) | 0xc4u);
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	*apid_out = apid;
++	*owner_out = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	IOLockUnlock(sp_lock);
++	return 0;
++}
++
+ /*
+  * One-byte write for the PMIC PON block. The ABL turns PON soft spare 0x88f
+  * into the boot mode it selects next, so the kernel writes the same "bootloader"
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 27ac707..f4bb358 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* Read-only APID and owner for PCLM10 PM8150L GPIO5; thread context. */
++int sweet_spmi_touch_gpio_owner(unsigned *apid_out, unsigned *owner_out);
+ /* PMIC PON block only (peripheral 0x08): the ABL's boot-reason byte. */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a4e4d60..9348451 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,6 +253,89 @@ AppleCLCD::start(IOService *provider)
+ 
+ static uint64_t sweet_fb_swap_count;
+ 
++/* Read-only paired samples for the opt-in CPU present diagnostic. They
++ * compare the same source/panel coordinates away from corner mattes;
++ * equal memory bytes do not establish what the physical panel shows. */
++static void
++sweet_fb_compare_cpu(const uint8_t *src, const uint8_t *dst,
++    uint32_t src_stride, uint32_t dst_stride, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h,
++    uint32_t panel_w, uint32_t panel_h, uint32_t corner_extent)
++{
++	static int enabled = -1;
++	static unsigned samples;
++	if (enabled < 0) {
++		enabled = 0;
++		PE_parse_boot_argn("sweetfb_compare", &enabled, sizeof(enabled));
++	}
++	if (!enabled || samples >= 10 || w <= 0 || h <= 0 ||
++	    dx != 0 || dy != 0 || (uint32_t)w != panel_w ||
++	    (uint32_t)h != panel_h || corner_extent * 2u >= panel_h) {
++		return;
++	}
++	/* The first few swaps can be black. Keep the budget for meaningful
++	 * frames so late lock-screen presents are compared as well. */
++	uint32_t probe_min[3] = {255, 255, 255}, probe_max[3] = {0, 0, 0};
++	for (uint32_t y = panel_h / 4u; y < panel_h * 3u / 4u; y += 32u) {
++		const volatile uint8_t *row = src + (uint64_t)(sy + y) * src_stride + (uint64_t)sx * 4u;
++		for (uint32_t x = 0; x < panel_w; x += 32u) {
++			for (unsigned k = 0; k < 3; k++) {
++				uint32_t v = row[4u * x + k];
++				if (v < probe_min[k]) probe_min[k] = v;
++				if (v > probe_max[k]) probe_max[k] = v;
++			}
++		}
++	}
++	uint32_t max_delta = 0;
++	for (unsigned k = 0; k < 3; k++) {
++		uint32_t delta = probe_max[k] - probe_min[k];
++		if (delta > max_delta) max_delta = delta;
++	}
++	if (max_delta < 8) {
++		return;
++	}
++	/* Do not spend all ten samples on consecutive animation frames. */
++	static uint32_t eligible;
++	if ((eligible++ % 15u) != 0) {
++		return;
++	}
++	uint64_t checked = 0, mismatch = 0;
++	uint64_t rdiff = 0, bdiff = 0, swapped = 0, transparent = 0;
++	uint32_t minv[4] = {255, 255, 255, 255};
++	uint32_t maxv[4] = {0, 0, 0, 0};
++	uint32_t y0 = corner_extent;
++	uint32_t y1 = panel_h - corner_extent;
++	for (uint32_t y = y0; y < y1; y += 16) {
++		const volatile uint8_t *s = src + (uint64_t)(sy + y) * src_stride + (uint64_t)sx * 4u;
++		const volatile uint8_t *d = dst + (uint64_t)y * dst_stride;
++		for (uint32_t x = 0; x < panel_w; x += 16) {
++			uint8_t a0 = s[4u * x], a1 = s[4u * x + 1u];
++			uint8_t a2 = s[4u * x + 2u], a3 = s[4u * x + 3u];
++			uint8_t b0 = d[4u * x], b1 = d[4u * x + 1u];
++			uint8_t b2 = d[4u * x + 2u], b3 = d[4u * x + 3u];
++			const uint8_t p[4] = {a0, a1, a2, a3};
++			if (a3 != 255) transparent++;
++			for (unsigned k = 0; k < 4; k++) {
++				if (p[k] < minv[k]) minv[k] = p[k];
++				if (p[k] > maxv[k]) maxv[k] = p[k];
++			}
++			checked++;
++			if (a0 != b0 || a1 != b1 || a2 != b2 || a3 != b3) {
++				mismatch++;
++				if (a0 != b0) bdiff++;
++				if (a2 != b2) rdiff++;
++				if (a0 == b2 && a2 == b0 && a1 == b1 && a3 == b3) swapped++;
++			}
++		}
++	}
++	IOLog("SWEET FB: compare %u CPU source crop=%d,%d size=%dx%d stride=%u/%u "
++	    "grid=%llu mismatches=%llu bdiff=%llu rdiff=%llu rb-swapped=%llu nonopaque=%llu "
++	    "source-min=%u/%u/%u/%u max=%u/%u/%u/%u\n",
++	    samples++, sx, sy, w, h, src_stride, dst_stride,
++	    checked, mismatch, bdiff, rdiff, swapped, transparent,
++	    minv[0], minv[1], minv[2], minv[3], maxv[0], maxv[1], maxv[2], maxv[3]);
++}
++
+ /*
+  * Opt-in panel sampling (boot-arg sweetfb_sample=1): after a frame has
+  * been copied, read back what the panel is about to scan and report it.
+@@ -703,6 +786,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (uint32_t)w);
+ 			}
++			sweet_fb_compare_cpu((const uint8_t *)(src + s->offset),
++			    (const uint8_t *)fPixels, s->bytesPerRow, fRowBytes,
++			    sx, sy, dx, dy, w, h, fWidth, fHeight, fCornerExt);
+ 		}
+ 		s->release();
+ 	}
