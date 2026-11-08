@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0164-flame-pclm10-framebuffer-map-average.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0165-flame-pclm10-framebuffer-map-paced.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -145,7 +145,6 @@ int main(void) {
         src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
         fn = extract_function(src, "sweet_fb_dump_map")
         self.assertIn("48x106", src)
-        self.assertIn("SWEET FB MAP %u %u %s", fn)
         self.assertIn("r += p[2]", fn)
         self.assertIn("g += p[1]", fn)
         self.assertIn("b += p[0]", fn)
@@ -154,9 +153,12 @@ int main(void) {
         self.assertIn("gy < 106", fn)
         self.assertIn("gx < 48", fn)
         self.assertIn("PE_parse_boot_argn(\"sweetfb_map\"", fn)
+        emit = extract_function(src, "sweet_fb_map_emit")
+        self.assertIn("SWEET FB MAP %u %u %s", emit)
+        self.assertIn("++sweet_fb_map_tick < 2", emit)
+        self.assertIn("sweet_fb_map_emit();", src)
         self.assertIn("{5, 15, 30, 60, 120, 240}", src)
         self.assertIn("if (slot >= 3)", src)
-        self.assertNotIn("SWEET FB MAP", src[:src.index(fn)])
 
     def test_touch_gpio_register_values(self):
         src = (ACTIVE_SOURCE / "bsd/dev/sweet_spmi.c").read_text(encoding="utf-8")
@@ -330,10 +332,10 @@ int main() {
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0163-r42501469285/xnu/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0163-r42501469285/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0163-r42501469285/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0163-r42501469285/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0164-r42503094288/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0164-r42503094288/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0164-r42503094288/xnu/bsd/dev/sweet_spmi.h",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0164-r42503094288/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:

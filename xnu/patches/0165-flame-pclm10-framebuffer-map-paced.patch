@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e875038..d8b55b7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,12 +253,43 @@ AppleCLCD::start(IOService *provider)
+ 
+ static uint64_t sweet_fb_swap_count;
+ 
++static uint8_t sweet_fb_map_pixels[48 * 106];
++static unsigned sweet_fb_map_slot = ~0u;
++static unsigned sweet_fb_map_row;
++static unsigned sweet_fb_map_tick;
++
++/* Paced one row per two vsyncs so the 16 KiB console ring is not
++ * overwritten by SpringBoard's log bursts. */
++static void
++sweet_fb_map_emit(void)
++{
++	if (sweet_fb_map_slot == ~0u || ++sweet_fb_map_tick < 2) {
++		return;
++	}
++	sweet_fb_map_tick = 0;
++	if (sweet_fb_map_row >= 106) {
++		sweet_fb_map_slot = ~0u;
++		return;
++	}
++	static const char hex[] = "0123456789abcdef";
++	char line[48 * 2 + 32];
++	int pos = 0;
++	const uint8_t *src = sweet_fb_map_pixels + sweet_fb_map_row * 48;
++	for (unsigned i = 0; i < 48; i++) {
++		line[pos++] = hex[src[i] >> 4];
++		line[pos++] = hex[src[i] & 15];
++	}
++	line[pos] = 0;
++	IOLog("SWEET FB MAP %u %u %s\n", sweet_fb_map_slot,
++	    sweet_fb_map_row, line);
++	sweet_fb_map_row++;
++}
++
+ /*
+  * Low-bandwidth screenshot for the serial log: average the panel over
+- * 48x106 blocks and emit RGB332 hex rows. Averaging (not point sampling)
+- * keeps small icons from disappearing between samples. The console ring
+- * is only 16 KiB, so maps are spaced across the sample slots. This reads
+- * panel memory only; the host reconstructs a PNG.
++ * 48x106 blocks into RGB332. Averaging (not point sampling) keeps small
++ * icons from disappearing between samples. The rows are emitted by the
++ * vsync callback. This reads panel memory only.
+  */
+ static void
+ sweet_fb_dump_map(const uint8_t *pixels, uint32_t width, uint32_t height,
+@@ -269,13 +300,11 @@ sweet_fb_dump_map(const uint8_t *pixels, uint32_t width, uint32_t height,
+ 		on = 0;
+ 		PE_parse_boot_argn("sweetfb_map", &on, sizeof(on));
+ 	}
+-	if (!on || pixels == 0 || width < 48 || height < 106) {
++	if (!on || pixels == 0 || width < 48 || height < 106 ||
++	    sweet_fb_map_slot != ~0u) {
+ 		return;
+ 	}
+-	static const char hex[] = "0123456789abcdef";
+ 	for (uint32_t gy = 0; gy < 106; gy++) {
+-		char line[48 * 2 + 32];
+-		int pos = 0;
+ 		uint32_t y0 = (uint32_t)((uint64_t)gy * height / 106);
+ 		uint32_t y1 = (uint32_t)((uint64_t)(gy + 1) * height / 106);
+ 		if (y1 <= y0) {
+@@ -301,14 +330,14 @@ sweet_fb_dump_map(const uint8_t *pixels, uint32_t width, uint32_t height,
+ 			if (n == 0) {
+ 				n = 1;
+ 			}
+-			uint8_t v = (uint8_t)(((r / n) & 0xe0u) |
+-			    (((g / n) >> 3) & 0x1cu) | (((b / n) >> 6) & 0x03u));
+-			line[pos++] = hex[v >> 4];
+-			line[pos++] = hex[v & 15];
++			sweet_fb_map_pixels[gy * 48 + gx] = (uint8_t)
++			    (((r / n) & 0xe0u) | (((g / n) >> 3) & 0x1cu) |
++			    (((b / n) >> 6) & 0x03u));
+ 		}
+-		line[pos] = 0;
+-		IOLog("SWEET FB MAP %u %u %s\n", slot, gy, line);
+ 	}
++	sweet_fb_map_slot = slot;
++	sweet_fb_map_row = 0;
++	sweet_fb_map_tick = 0;
+ }
+ 
+ /* Read-only paired samples for the opt-in CPU present diagnostic. They
+@@ -505,6 +534,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fNextVsync = now + fb->fVsyncAbs;
+ 	}
+ 	sender->wakeAtTime(fb->fNextVsync);
++	sweet_fb_map_emit();
+ 	if ((count % 300) == 0) {
+ 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
+ 		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
