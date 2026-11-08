@@ -1,0 +1,339 @@
+diff --git a/bsd/dev/sweet_s3706.c b/bsd/dev/sweet_s3706.c
+index c18905f..14f8531 100644
+--- a/bsd/dev/sweet_s3706.c
++++ b/bsd/dev/sweet_s3706.c
+@@ -10,8 +10,13 @@
+  * 1/2/4, branch CRs 0x1e004/0x1e008/0x1e144, RCG 0x1e148 = XO/1). The
+  * IC keeps its firmware and configuration in flash; this driver only
+  * powers, resets, reads descriptors, and polls reports. The GENI SE must
+- * be in ABL/XBL-loaded I2C firmware mode with FIFO access, polled exactly
+- * like sweet_touch.c; TLMM is reached through the south tile like
++ * be in ABL/XBL-loaded I2C firmware mode; transfers run over the SE's
++ * own DMA engine (SE_DMA_*, the geni_se_tx/rx_init_dma recipe, identical
++ * in the vendor 5.4 and upstream qcom-geni-se.c) because PCLM10's
++ * firmware disabled this SE's FIFO interface (GENI_IF_DISABLE_RO bit 0;
++ * the round that probed through the FIFO timed out exactly as that
++ * declares, while bit 1 shows the DMA interface enabled); TLMM is
++ * reached through the south tile like
+  * sweet_fts.c (same SoC, proven there). Coordinates are already panel
+  * pixels (DTBO panel-coords = display-coords = 1080x2400).
+  * Boot-args: s3706=1 enable (default off), s3706delay=N start after N s
+@@ -25,9 +30,15 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* as sweet_ufs.c: this build tree does not expose the declaration */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+@@ -101,12 +112,48 @@ void sweet_s3706_init(void);
+ /* geni_se_config_packing(8, 4, true, true, true): as sweet_touch.c. */
+ #define SE_PACK0        0x0007f8feu
+ #define SE_PACK1        0x000ffefeu
++/*
++ * The SE's own DMA engine. Offsets and bits from the vendor 5.4
++ * qcom-geni-se.c (the tree SM8150 runs) and upstream qcom-geni-se.c,
++ * which agree register for register; all inside the mapped SE block.
++ */
++#define SE_DTX_PTR_L      0xc30u
++#define SE_DTX_PTR_H      0xc34u
++#define SE_DTX_ATTR       0xc38u
++#define SE_DTX_LEN        0xc3cu
++#define SE_DTX_IRQ        0xc40u /* status, write-1-to-clear below */
++#define SE_DTX_IRQ_CLR    0xc44u
++#define SE_DTX_IRQ_EN_SET 0xc4cu
++#define SE_DTX_LEN_IN     0xc54u
++#define SE_DRX_PTR_L      0xd30u
++#define SE_DRX_PTR_H      0xd34u
++#define SE_DRX_ATTR       0xd38u
++#define SE_DRX_LEN        0xd3cu
++#define SE_DRX_IRQ        0xd40u
++#define SE_DRX_IRQ_CLR    0xd44u
++#define SE_DRX_IRQ_EN_SET 0xd4cu
++#define SE_DRX_LEN_IN     0xd54u
++#define SE_DRX_FLUSH      0xd60u
++/* *_IRQ_EN_SET / *_IRQ bits (GENI_SE_DMA_*_EN) and *_IRQ_STAT bits
++ * (TX_DMA_DONE, TX_EOT, RX_DMA_DONE, RX_EOT, *_SBE, RX_FLUSH_DONE). */
++#define DMA_DONE_EN       (1u << 0)
++#define DMA_EOT_EN        (1u << 1)
++#define DMA_AHB_ERR_EN    (1u << 2)
++#define DMA_FLUSH_DONE    (1u << 4)
++#define DMA_EOT_BUF       (1u << 0) /* *_ATTR: one end-of-transfer buffer */
++/* Layout of the contiguous DMA page: TX image, then RX landing area. */
++#define TP_DMA_TX         0x000u
++#define TP_DMA_RX         0x400u
++#define TP_DMA_SIZE       0x1000u
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
++	vm_offset_t dma;
++	uint64_t dma_pa;
+ 	bool started, dead, probing;
+ 	int log;
+ 	uint32_t irq_status, irq_last;
++	uint32_t dtx_last, drx_last, drin;
+ 	unsigned sent, got;
+ 	uint8_t f12_data;
+ 	uint32_t active;
+@@ -152,6 +199,32 @@ tp_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 	return false;
+ }
+ 
++/*
++ * The SE DMA master reads and writes raw physical addresses: one
++ * contiguous zeroed page, the sweet_ufs.c recipe (kmem_alloc_contig +
++ * pmap_find_phys + ptoa_64). TX images go to TP_DMA_TX, RX data lands
++ * at TP_DMA_RX; the two areas are a cache line apart, so a directional
++ * maintenance op for one can never touch the other's data.
++ */
++static bool
++tp_dma_alloc(void)
++{
++	if (kmem_alloc_contig(kernel_map, &st.dma, TP_DMA_SIZE, PAGE_MASK, 0,
++	    0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET S3706: no contiguous DMA memory; stopping\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)st.dma);
++	if (!pn) {
++		printf("SWEET S3706: DMA page is not mapped; stopping\n");
++		return false;
++	}
++	st.dma_pa = ptoa_64(pn);
++	printf("SWEET S3706: DMA page pa=%#llx\n", st.dma_pa);
++	return true;
++}
++
+ /* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
+ static void
+ tp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+@@ -242,6 +315,16 @@ tp_abort(void)
+ 	for (unsigned i = 0; i < 64 && (tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+ 		(void)tp_rd(st.se, SE_RX);
+ 	}
++	/* Drop what the DMA engines still hold (geni_se_abort_dma: RX
++	 * flush, bounded wait for the flush-done status bit, clear). */
++	tp_wr(st.se, SE_DRX_FLUSH, 1);
++	for (unsigned i = 0; i < 1000 &&
++	    !(tp_rd(st.se, SE_DRX_IRQ) & DMA_FLUSH_DONE); ++i) {
++		delay(1);
++	}
++	tp_wr(st.se, SE_DRX_FLUSH, 0);
++	tp_wr(st.se, SE_DTX_IRQ_CLR, 0xffffffffu);
++	tp_wr(st.se, SE_DRX_IRQ_CLR, 0xffffffffu);
+ 	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	if (tp_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+ 		st.dead = true;
+@@ -257,73 +340,99 @@ tp_irq(void)
+ 	return st.irq_last;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/*
++ * One message over the SE's own DMA engine: the geni_se_tx/rx_init_dma
++ * recipe (program PTR/ATTR/LEN, enable DONE|EOT|AHB_ERR, then trigger
++ * the same M command the FIFO path used; upstream i2c-qcom-geni.c
++ * drives it exactly this way in GENI_SE_DMA mode). TX is at most 3
++ * bytes; RX at most 90; both move through the contiguous DMA page.
++ */
+ static int
+ tp_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || !st.dma_pa || nt > 3 || nr > 90 || (nt && nr) ||
++	    (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!tp_wait_clear(st.se, SE_STATUS, 1u)) {
+ 		st.dead = true; /* no other SE17 owner is supported */
+ 		return EBUSY;
+ 	}
++	uint32_t off = nr ? TP_DMA_RX : TP_DMA_TX;
++	uint64_t pa = st.dma_pa + off;
++	if (nt) {
++		memcpy((void *)(st.dma + TP_DMA_TX), tx, nt);
++		clean_dcache64((addr64_t)(st.dma_pa + TP_DMA_TX), nt, TRUE);
++	}
++	st.dtx_last = st.drx_last = st.drin = 0;
+ 	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	tp_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
+-	tp_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	tp_wr(st.se, SE_DTX_IRQ_CLR, 0xffffffffu);
++	tp_wr(st.se, SE_DRX_IRQ_CLR, 0xffffffffu);
++	uint32_t en = DMA_DONE_EN | DMA_EOT_EN | DMA_AHB_ERR_EN;
++	if (nr) {
++		tp_wr(st.se, SE_DRX_IRQ_EN_SET, en);
++		tp_wr(st.se, SE_DRX_PTR_L, (uint32_t)pa);
++		tp_wr(st.se, SE_DRX_PTR_H, (uint32_t)(pa >> 32));
++		tp_wr(st.se, SE_DRX_ATTR, DMA_EOT_BUF);
++		tp_wr(st.se, SE_DRX_LEN, nr);
++		tp_wr(st.se, SE_RX_LEN, nr);
++	} else {
++		tp_wr(st.se, SE_DTX_IRQ_EN_SET, en);
++		tp_wr(st.se, SE_DTX_PTR_L, (uint32_t)pa);
++		tp_wr(st.se, SE_DTX_PTR_H, (uint32_t)(pa >> 32));
++		tp_wr(st.se, SE_DTX_ATTR, DMA_EOT_BUF);
++		tp_wr(st.se, SE_DTX_LEN, nt);
++		tp_wr(st.se, SE_TX_LEN, nt);
++	}
+ 	tp_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 20000; ++i) {
+ 		uint32_t irq = tp_irq();
++		uint32_t dstat = nr ? tp_rd(st.se, SE_DRX_IRQ)
++		    : tp_rd(st.se, SE_DTX_IRQ);
++		if (nr) {
++			st.drx_last |= dstat;
++		} else {
++			st.dtx_last |= dstat;
++		}
++		if (dstat & DMA_AHB_ERR_EN) {
++			err = EIO; /* the DMA master faulted (SMMU?) */
++			break;
++		}
+ 		if (irq & SE_ERRORS) {
+ 			err = (irq & SE_NACK) ? ENXIO : EIO;
+ 			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+ 				delay(1);
+ 				irq = tp_irq();
+ 			}
+-			if ((irq & SE_DONE) && !(tp_rd(st.se, SE_STATUS) & 1u) &&
+-			    !(tp_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
+-			    !(tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++			if (irq & SE_DONE) {
+ 				tp_wr(st.se, SE_IRQ_CLR, irq);
++				tp_wr(st.se, nr ? SE_DRX_IRQ_CLR : SE_DTX_IRQ_CLR,
++				    0xffffffffu);
+ 				return err;
+ 			}
+ 			break;
+ 		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
+-			}
+-			tp_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			tp_wr(st.se, SE_TX_WM, 0);
+-		}
+-		uint32_t count = tp_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+-		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
+-			err = EIO;
+-			break;
+-		}
+-		while (count--) {
+-			uint32_t word = tp_rd(st.se, SE_RX);
+-			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
+-				rx[st.got++] = (uint8_t)(word >> (8u * j));
+-			}
+-		}
+ 		if (irq & SE_DONE) {
+-			irq = tp_irq();
+-			if (irq & SE_ERRORS) {
+-				continue;
+-			}
++			dstat = nr ? tp_rd(st.se, SE_DRX_IRQ)
++			    : tp_rd(st.se, SE_DTX_IRQ);
+ 			tp_wr(st.se, SE_IRQ_CLR, irq);
+-			if (st.got == nr && st.sent == nt) {
+-				return 0;
++			tp_wr(st.se, nr ? SE_DRX_IRQ_CLR : SE_DTX_IRQ_CLR, dstat);
++			if (!(dstat & (DMA_DONE_EN | DMA_EOT_EN))) {
++				err = EIO; /* sequencer done, DMA engine not */
++				break;
+ 			}
+-			err = EIO;
+-			break;
++			if (nr) {
++				st.drin = tp_rd(st.se, SE_DRX_LEN_IN);
++				flush_dcache64((addr64_t)pa, nr, TRUE);
++				memcpy(rx, (void *)(st.dma + off), nr);
++				st.got = nr;
++			}
++			st.sent = nt;
++			return 0;
+ 		}
+-		tp_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
+ 		delay(1);
+ 	}
+ 	tp_abort();
+@@ -338,10 +447,10 @@ tp_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	st.sent = st.got = 0;
+ 	int err = tp_msg_run(addr, tx, nt, rx, nr, stretch);
+ 	if (st.probing) {
+-		printf("SWEET S3706: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		printf("SWEET S3706: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x dtx=%#x drx=%#x rin=%u tx=%u rx=%u status=%#x\n",
+ 		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    tp_rd(st.se, SE_STATUS));
++		    err, st.irq_last, st.irq_status, st.dtx_last, st.drx_last,
++		    st.drin, st.sent, st.got, tp_rd(st.se, SE_STATUS));
+ 	}
+ 	return err;
+ }
+@@ -387,17 +496,17 @@ tp_se_init(void)
+ 	/*
+ 	 * 0x64 (GENI_IF_DISABLE_RO, bit 0 = FIFO_IF_DISABLE, vendor
+ 	 * geni-se.h) is set on this SE: PCLM10's firmware declared the
+-	 * FIFO interface disabled - the vendor i2c driver switches to GPI
+-	 * DMA on that bit, and its DT wires gpi_dma2 to this bus. It is
++	 * FIFO interface disabled - the vendor i2c driver switches to DMA
++	 * on that bit, and its DT wires gpi_dma2 to this bus. It is
+ 	 * read-only here: the writable SE_FIFO_IF_DISABLE (0x2008) that
+ 	 * newer QUP generations toggle does not exist on SM8150 (zero
+ 	 * hits in the vendor 5.4 tree), and the round that first touched
+-	 * it hung its thread on the access. The vendor 5.4 driver selects
+-	 * FIFO mode by clearing SE_GENI_DMA_MODE_EN (0x258), which
+-	 * tp_se_init already does, so treat the bit as information and
+-	 * let the probe transfers themselves arbitrate: if the FIFO path
+-	 * is really dead, their error log names the failure mode and the
+-	 * next step is GSI.
++	 * it hung its thread on the access. The FIFO arbitration round
++	 * confirmed the declaration: the page-select write timed out with
++	 * only a TX-watermark event and no M-engine progress. Bit 1
++	 * (DMA_IF_DISABLE) is clear, so select the SE's own DMA transfer
++	 * interface instead: geni_se_select_dma_mode masks the
++	 * FIFO-watermark M_IRQ enables and sets SE_GENI_DMA_MODE_EN.
+ 	 */
+ 	if (((fw >> 8) & 0xffu) != 3u ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) < 1u ||
+@@ -416,7 +525,7 @@ tp_se_init(void)
+ 	tp_wr(st.se, 0x644, 0);
+ 	tp_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	tp_wr(st.se, 0x648, 0xffffffffu);
+-	tp_wr(st.se, SE_DMA, 0);
++	tp_wr(st.se, SE_DMA, 1); /* SE_GENI_DMA_MODE_EN: DMA transfers */
+ 	tp_wr(st.se, 0x28, tp_rd(st.se, 0x28) | 0x7fu);
+ 	tp_wr(st.se, 0xe30, tp_rd(st.se, 0xe30) | 0x0fu);
+ 	tp_wr(st.se, 0x24, 0x7f);
+@@ -433,7 +542,7 @@ tp_se_init(void)
+ 	tp_wr(st.se, SE_TX_WM, 0);
+ 	tp_wr(st.se, 0x810, 0);
+ 	tp_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	tp_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	tp_wr(st.se, SE_IRQ_EN, SE_DONE | SE_ERRORS); /* no FIFO watermarks */
+ 	if (tp_rd(st.se, 0x260) != SE_PACK0 || tp_rd(st.se, 0x264) != SE_PACK1 ||
+ 	    tp_rd(st.se, 0x284) != SE_PACK0 || tp_rd(st.se, 0x288) != SE_PACK1 ||
+ 	    tp_rd(st.se, 0x254) != 0) {
+@@ -600,6 +709,9 @@ tp_thread(void *arg, wait_result_t result)
+ 		printf("SWEET S3706: MMIO mapping failed\n");
+ 		goto out;
+ 	}
++	if (!tp_dma_alloc()) {
++		goto out;
++	}
+ 	printf("SWEET S3706: TLMM cfg/io en=%#x/%#x reset=%#x/%#x irq=%#x/%#x sda=%#x/%#x\n",
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_EN1V8)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_EN1V8)),
+ 	    tp_rd(st.gpio, TP_GPIO_CFG(TP_PIN_RESET)), tp_rd(st.gpio, TP_GPIO_IO(TP_PIN_RESET)),
