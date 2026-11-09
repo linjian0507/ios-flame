@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0188-flame-pclm10-files-puta.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0189-flame-pclm10-gpu-multi-layer.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -212,6 +212,16 @@ int main(void) {
         self.assertIn("(off_t)(off0 + done)", body)
         self.assertNotIn("vnode_setsize", body)
         self.assertNotIn("O_TRUNC", body)
+
+    def test_present_gpu_accepts_multiple_layers(self):
+        # 0189: SweetMetal2's backboardd swaps the main layer plus overlays.
+        # Requiring exactly one layer forced the CPU copy, which could not see
+        # Turnip's GPU-cache writes; select the first enabled layer instead.
+        src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        self.assertIn("AppleCLCD::presentGPU", src)
+        self.assertIn("if (mask == 0)", src)
+        self.assertIn("while (layer < SWEET_FB_LAYERS && !(mask & (1u << layer)))", src)
+        self.assertNotIn("mask & (mask - 1)", src)
 
     def test_source_map_is_opt_in(self):
         src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -450,10 +460,10 @@ int main() {
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
             "bsd/dev/sweet_usb.c": ROOT / "work/patch-0183/post/bsd/dev/sweet_usb.c",
-            "bsd/dev/sweet_files.c": ROOT / "work/patch-0187/post/bsd/dev/sweet_files.c",
-            "bsd/dev/sweet_ufs.c": ROOT / "work/patch-0187/post/bsd/dev/sweet_ufs.c",
+            "bsd/dev/sweet_files.c": ROOT / "work/patch-0188/post/bsd/dev/sweet_files.c",
+            "bsd/dev/sweet_ufs.c": ROOT / "work/patch-0188/post/bsd/dev/sweet_ufs.c",
             # 0173's preimage includes 0172's framebuffer changes.
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0182/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0188/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:

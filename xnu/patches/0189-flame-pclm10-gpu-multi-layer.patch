@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3ba25e5..6f9826b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -824,10 +824,17 @@ bool
+ AppleCLCD::presentGPU(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104), layer = 0;
+-	if (mask == 0 || (mask & (mask - 1))) {
+-		return gpu_fallback(0, "not exactly one layer");
++	if (mask == 0) {
++		return gpu_fallback(0, "no layers");
+ 	}
+-	while (!(mask & (1u << layer))) {
++	/*
++	 * SweetMetal2's render server swaps the main 1125x2436 layer plus
++	 * overlay layers. The CPU copy reads that surface only after the GPU
++	 * cache is flushed; the 2D present reads it through the GPU and sees
++	 * the Turnip writes. Use the first enabled (main) layer instead of
++	 * requiring exactly one.
++	 */
++	while (layer < SWEET_FB_LAYERS && !(mask & (1u << layer))) {
+ 		layer++;
+ 	}
+ 	if (layer >= SWEET_FB_LAYERS) {
