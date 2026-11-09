@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0180-flame-pclm10-rndis-drop-media-indicate.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0181-flame-pclm10-framebuffer-source-map.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -178,6 +178,14 @@ int main(void) {
         # so a 32-byte SEND left residual 32 and was read as zero bytes.
         self.assertIn("uint32_t    encmd_xlen;", src)
         self.assertIn("got = ud.encmd_xlen ? ud.encmd_xlen - (t[2] & 0xffffff) : ud.encmd_len;", src)
+
+    def test_source_map_is_opt_in(self):
+        src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        # 0181: dump SpringBoard's source IOSurface, not the panel copy,
+        # so an App Library split can be attributed before guessing.
+        self.assertIn('PE_parse_boot_argn("sweetfb_map_src"', src)
+        self.assertIn("SWEET FB: source map surface", src)
+        self.assertIn("src_elapsed >= 80 * 1000000000ULL", src)
 
     def test_map_quiesces_usb_setup_logs(self):
         fb = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -407,7 +415,7 @@ int main() {
             "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_s3706.c",
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
-            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0179/post/bsd/dev/sweet_usb.c",
+            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0180/post/bsd/dev/sweet_usb.c",
             # 0173's preimage includes 0172's framebuffer changes.
             "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0172/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }

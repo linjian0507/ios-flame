@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f09c327..3235a1f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -900,7 +900,18 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+-
++	static uint64_t src_start;
++	static bool src_done;
++	static int src_on = -1;
++	if (src_on < 0) {
++		src_on = 0;
++		PE_parse_boot_argn("sweetfb_map_src", &src_on, sizeof(src_on));
++	}
++	if (src_start == 0) {
++		src_start = mach_absolute_time();
++	}
++	uint64_t src_elapsed = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - src_start, &src_elapsed);
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -987,6 +998,18 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			/* Opt-in source-surface map: shows whether a split/white
++			 * background is already in SpringBoard's IOSurface before
++			 * the CPU copy, or introduced by the panel path. */
++			if (src_on && !src_done && layer == 0 &&
++			    src_elapsed >= 80 * 1000000000ULL) {
++				src_done = true;
++				IOLog("SWEET FB: source map surface %u %ux%u fmt 0x%x bpr %u\n",
++				    id, s->width, s->height, s->pixelFormat, s->bytesPerRow);
++				sweet_fb_dump_map_hd(
++				    (const uint8_t *)(src + s->offset),
++				    s->width, s->height, s->bytesPerRow);
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				copyRow((uint32_t)dx, (uint32_t)(dy + y),
+ 				    (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
