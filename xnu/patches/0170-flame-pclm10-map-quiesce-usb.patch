@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6e526a8..81298d9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -40,6 +40,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++/* Set by the framebuffer panel-map capture to keep console lines whole. */
++extern int sweet_map_quiet;
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -971,7 +973,9 @@ ud_setup(void)
+ 	uint32_t n = 0;
+ 	bool ok = true;
+ 
+-	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	if (!sweet_map_quiet) {
++		printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	}
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class interface request */
+ 		if (!ud.rndis) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b41e19d..36778d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -258,6 +258,9 @@ static unsigned sweet_fb_map_slot = ~0u;
+ static unsigned sweet_fb_map_row;
+ static unsigned sweet_fb_map_tick;
+ 
++/* Suppresses USB setup chatter while a map is being emitted. */
++int sweet_map_quiet;
++
+ /* High-colour 96x213 RGB565 map for judging gradients and icons. */
+ #define SWEET_FB_HD_W 96
+ #define SWEET_FB_HD_H 213
+@@ -275,6 +278,7 @@ sweet_fb_map_hd_emit(void)
+ 	sweet_fb_hd_tick = 0;
+ 	if (sweet_fb_hd_row >= SWEET_FB_HD_H) {
+ 		sweet_fb_hd_active = false;
++		sweet_map_quiet = 0;
+ 		return;
+ 	}
+ 	static const char hex[] = "0123456789abcdef";
+@@ -334,6 +338,7 @@ sweet_fb_dump_map_hd(const uint8_t *pixels, uint32_t width, uint32_t height,
+ 	sweet_fb_hd_row = 0;
+ 	sweet_fb_hd_tick = 0;
+ 	sweet_fb_hd_active = true;
++	sweet_map_quiet = 1;
+ }
+ 
+ /* Paced one row per two vsyncs so the 16 KiB console ring is not
+@@ -347,6 +352,7 @@ sweet_fb_map_emit(void)
+ 	sweet_fb_map_tick = 0;
+ 	if (sweet_fb_map_row >= 106) {
+ 		sweet_fb_map_slot = ~0u;
++		sweet_map_quiet = 0;
+ 		return;
+ 	}
+ 	static const char hex[] = "0123456789abcdef";
+@@ -416,6 +422,7 @@ sweet_fb_dump_map(const uint8_t *pixels, uint32_t width, uint32_t height,
+ 	sweet_fb_map_slot = slot;
+ 	sweet_fb_map_row = 0;
+ 	sweet_fb_map_tick = 0;
++	sweet_map_quiet = 1;
+ }
+ 
+ /* Read-only paired samples for the opt-in CPU present diagnostic. They

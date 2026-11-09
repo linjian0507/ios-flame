@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0169-flame-pclm10-framebuffer-hdmap.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0170-flame-pclm10-map-quiesce-usb.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -140,6 +140,16 @@ int main(void) {
         candidate = module.args("unixnu-p4-touch-surf10.toml")
         self.assertEqual(sorted(set(candidate) - set(base)), ["sweetsurf10=2"])
         self.assertEqual(sorted(set(base) - set(candidate)), [])
+
+    def test_map_quiesces_usb_setup_logs(self):
+        fb = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
+        usb = (ACTIVE_SOURCE / "bsd/dev/sweet_usb.c").read_text(encoding="utf-8")
+        self.assertIn("int sweet_map_quiet;", fb)
+        self.assertIn("sweet_map_quiet = 1;", fb)
+        self.assertIn("sweet_map_quiet = 0;", fb)
+        self.assertIn("extern int sweet_map_quiet;", usb)
+        self.assertIn("if (!sweet_map_quiet) {", usb)
+        self.assertIn("SWEET USB: setup %02x", usb)
 
     def test_high_colour_map_is_bounded(self):
         src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -356,10 +366,11 @@ int main() {
         if not git:
             self.skipTest("git not available")
         originals = {
-            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0168-r42508921157/xnu/bsd/dev/sweet_s3706.c",
-            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0168-r42508921157/xnu/bsd/dev/sweet_spmi.c",
-            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0168-r42508921157/xnu/bsd/dev/sweet_spmi.h",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0168-r42508921157/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0169-r42542325769/xnu/bsd/dev/sweet_s3706.c",
+            "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0169-r42542325769/xnu/bsd/dev/sweet_spmi.c",
+            "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0169-r42542325769/xnu/bsd/dev/sweet_spmi.h",
+            "bsd/dev/sweet_usb.c": ROOT / "work/buildtree-0169-r42542325769/xnu/bsd/dev/sweet_usb.c",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0169-r42542325769/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:
