@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0183-flame-pclm10-rndis-media-notify-thread.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0184-flame-pclm10-ufs-read.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -181,6 +181,18 @@ int main(void) {
         # so a 32-byte SEND left residual 32 and was read as zero bytes.
         self.assertIn("uint32_t    encmd_xlen;", src)
         self.assertIn("got = ud.encmd_xlen ? ud.encmd_xlen - (t[2] & 0xffffff) : ud.encmd_len;", src)
+
+    def test_ufs_partition_read_is_read_only(self):
+        files = (ACTIVE_SOURCE / "bsd/dev/sweet_files.c").read_text(encoding="utf-8")
+        ufs = (ACTIVE_SOURCE / "bsd/dev/sweet_ufs.c").read_text(encoding="utf-8")
+        self.assertIn("READUFS ", files)
+        self.assertIn("sweet_ufs_read_partition", files)
+        self.assertIn("sweet_ufs_read_partition", ufs)
+        body = extract_function(ufs, "sweet_ufs_read_partition")
+        self.assertIn("ufs_find_partition(name)", body)
+        self.assertIn("ufs_read_blocks(first + lba", body)
+        self.assertIn("lck_mtx_lock(&sweet_ufs_lock);", body)
+        self.assertNotIn("ufs_write_blocks", body)
 
     def test_source_map_is_opt_in(self):
         src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -418,7 +430,9 @@ int main() {
             "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_s3706.c",
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
-            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0180/post/bsd/dev/sweet_usb.c",
+            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0183/post/bsd/dev/sweet_usb.c",
+            "bsd/dev/sweet_files.c": ROOT / "work/src-0171-full/xnu/bsd/dev/sweet_files.c",
+            "bsd/dev/sweet_ufs.c": ROOT / "work/src-0171-full/xnu/bsd/dev/sweet_ufs.c",
             # 0173's preimage includes 0172's framebuffer changes.
             "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0182/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }

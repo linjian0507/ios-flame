@@ -1,0 +1,101 @@
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index dedded7..f90e411 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -36,6 +36,7 @@
+ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+ extern int sweet_vfs_unlink(const char *path);
++extern int sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len);
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_files_start(void);
+ 
+@@ -309,6 +310,33 @@ sf_handle(socket_t so)
+ 		printf("SWEET FILES: READ %s %llu %llu -> %d\n", a, off, n, err);
+ 		return;
+ 	}
++	if (!strncmp(line, "READUFS ", 8)) {
++		/* Raw read-only view of a GPT partition ("system", "vendor") for
++		 * host-side ext4/firmware extraction. The kernel UFS layer does
++		 * the block reads under its own lock. */
++		char *p = line + 8, *sp = strchr(p, ' ');
++		if (!sp || (size_t)(sp - p) >= sizeof(a)) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		memcpy(a, p, (size_t)(sp - p));
++		a[sp - p] = 0;
++		unsigned long long off = strtoull(sp + 1, &p, 10);
++		n = sf_dec(p);
++		if (n == 0 || n > SF_BUF) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		err = sweet_ufs_read_partition(a, off, sf_buf, (size_t)n);
++		if (!err) {
++			sf_reply(so, 0, n, true);
++			err = sf_send(so, sf_buf, (size_t)n);
++		} else {
++			sf_reply(so, err, 0, false);
++		}
++		printf("SWEET FILES: READUFS %s %llu %llu -> %d\n", a, off, n, err);
++		return;
++	}
+ 	char *sp = strchr(line, ' ');
+ 	if (!sp) {
+ 		sf_reply(so, EINVAL, 0, false);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 05fdddf..e32a46b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -359,6 +359,50 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/*
++ * Read-only raw view of a named GPT partition for the file server
++ * (bsd/dev/sweet_files.c). The caller's buffer is filled in bounce-sized
++ * chunks while sweet_ufs_lock excludes the mounted root I/O; su's
++ * userdata bounds are saved and restored around the GPT lookup.
++ */
++int
++sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len)
++{
++	uint64_t save_first, save_n, first, n;
++	int error;
++
++	if (len == 0) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	save_first = su.first_block;
++	save_n = su.nblocks;
++	error = ufs_find_partition(name);
++	first = su.first_block;
++	n = su.nblocks;
++	su.first_block = save_first;
++	su.nblocks = save_n;
++	if (!error && (off > n * UFS_BLOCK || len > n * UFS_BLOCK - off)) {
++		error = EINVAL;
++	}
++	for (size_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN((uint64_t)len - done,
++		    (uint64_t)BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		error = ufs_read_blocks(first + lba, blocks);
++		if (!error) {
++			memcpy((char *)buf + done,
++			    (const char *)(su.dma + DMA_BOUNCE) + skip, want);
++		}
++		done += want;
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
