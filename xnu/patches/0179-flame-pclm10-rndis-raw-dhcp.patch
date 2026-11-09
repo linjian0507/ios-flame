@@ -1,0 +1,152 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f14ab12..6a71f4a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1438,10 +1438,7 @@ ud_if_create(void)
+ 		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		/* Limited broadcast: the host's DHCP client still has APIPA,
+-		 * so a 192.168.7.255 destination is dropped by its IP stack.
+-		 * 255.255.255.255 is accepted before an address exists. */
+-		a->sin_addr.s_addr = htonl(0xffffffff);
++		a->sin_addr.s_addr = htonl(0xc0a807ff);         /* 192.168.7.255 */
+ 		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+ 		sock_close(so);
+ 	}
+@@ -1456,16 +1453,60 @@ ud_if_create(void)
+  * options (message type, server id, lease, mask/router/DNS/broadcast)
+  * are enough for the in-box DHCP client to take 192.168.7.1/24 and install
+  * the connected route to 192.168.7.2.
++ *
++ * The reply is a complete Ethernet/IPv4/UDP frame sent through the RNDIS
++ * TX path, not through the socket stack: the host still has APIPA, so
++ * 192.168.7.255 is not one of its broadcast addresses, and the phone has
++ * no route to 255.255.255.255. A unicast frame to the host's chaddr with
++ * IP destination 255.255.255.255 is accepted before it has an address.
+  */
++static uint16_t
++ud_ip_csum(const uint8_t *p, uint32_t n)
++{
++	uint32_t sum = 0;
++	for (uint32_t i = 0; i + 1 < n; i += 2) {
++		sum += ((uint32_t)p[i] << 8) | p[i + 1];
++	}
++	if (n & 1) {
++		sum += (uint32_t)p[n - 1] << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
+ static void
+-ud_dhcp_reply(socket_t so, const uint8_t *req, uint8_t type)
++ud_tx_frame_raw(const uint8_t *frame, uint32_t len)
++{
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
++		return;
++	}
++	if (mbuf_copyback(m, 0, len, frame, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(m);
++		return;
++	}
++	mbuf_pkthdr_setlen(m, len);
++	lck_mtx_lock(ud.lock);
++	if (ud.txq_count < UD_TXQ) {
++		ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
++		ud.txq_count++;
++		ud_tx_kick_locked();
++	} else {
++		mbuf_freem(m);
++	}
++	lck_mtx_unlock(ud.lock);
++}
++
++static void
++ud_dhcp_reply(const uint8_t *req, uint8_t type)
+ {
+ 	uint8_t rep[300];
+-	uint8_t *o;
+-	struct sockaddr_in to;
+-	struct iovec iov;
+-	struct msghdr msg;
+-	size_t sent = 0;
++	uint8_t frame[14 + 20 + 8 + 300];
++	uint8_t *o, *ip, *udp;
++	uint32_t l4, total;
++	uint16_t csum;
+ 
+ 	bzero(rep, sizeof(rep));
+ 	rep[0] = 2;                     /* BOOTREPLY */
+@@ -1492,28 +1533,35 @@ ud_dhcp_reply(socket_t so, const uint8_t *req, uint8_t type)
+ 	if ((size_t)(o - rep) < sizeof(rep)) {
+ 		o = rep + sizeof(rep);
+ 	}
+-	bzero(&to, sizeof(to));
+-	to.sin_len = sizeof(to);
+-	to.sin_family = AF_INET;
+-	to.sin_port = htons(68);
+-	iov.iov_base = rep;
+-	iov.iov_len = (size_t)(o - rep);
+-	bzero(&msg, sizeof(msg));
+-	msg.msg_iov = &iov;
+-	msg.msg_iovlen = 1;
+-	msg.msg_name = &to;
+-	msg.msg_namelen = sizeof(to);
+-	/* The client still has APIPA 169.254/16, so 192.168.7.255 is not a
+-	 * broadcast for its current interface and is dropped before UDP.
+-	 * The limited broadcast is accepted without an address; send both. */
+-	size_t sent1 = 0, sent2 = 0;
+-	to.sin_addr.s_addr = 0xffffffffu;
+-	errno_t err1 = sock_send(so, &msg, 0, &sent1);
+-	to.sin_addr.s_addr = htonl(0xc0a807ff);         /* 192.168.7.255 */
+-	errno_t err2 = sock_send(so, &msg, 0, &sent2);
+-	printf("SWEET DHCP: %s for %02x:%02x:%02x:%02x:%02x:%02x (send %d/%d, %u B)\n",
++	memcpy(frame, req + 28, 6);             /* host MAC from chaddr */
++	memcpy(frame + 6, ud_phone_mac, 6);
++	frame[12] = 0x08;
++	frame[13] = 0x00;
++	ip = frame + 14;
++	udp = ip + 20;
++	l4 = 8 + (uint32_t)sizeof(rep);
++	total = 20 + l4;
++	bzero(ip, 20);
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)(total >> 8);
++	ip[3] = (uint8_t)total;
++	ip[8] = 64;                             /* TTL */
++	ip[9] = 17;                             /* UDP */
++	ip[12] = 192; ip[13] = 168; ip[14] = 7; ip[15] = 2;
++	ip[16] = 255; ip[17] = 255; ip[18] = 255; ip[19] = 255;
++	csum = ud_ip_csum(ip, 20);
++	ip[10] = (uint8_t)(csum >> 8);
++	ip[11] = (uint8_t)csum;
++	udp[0] = 0; udp[1] = 67;
++	udp[2] = 0; udp[3] = 68;
++	udp[4] = (uint8_t)(l4 >> 8);
++	udp[5] = (uint8_t)l4;
++	udp[6] = 0; udp[7] = 0;                 /* UDP checksum optional */
++	memcpy(udp + 8, rep, sizeof(rep));
++	ud_tx_frame_raw(frame, total + 14);
++	printf("SWEET DHCP: %s for %02x:%02x:%02x:%02x:%02x:%02x (raw %u B)\n",
+ 	    type == 2 ? "OFFER" : "ACK", req[28], req[29], req[30], req[31], req[32],
+-	    req[33], err1, err2, (unsigned)sent1);
++	    req[33], (unsigned)(total + 14));
+ }
+ 
+ static void
+@@ -1573,9 +1621,9 @@ ud_dhcp_thread(void *arg __unused, wait_result_t wr __unused)
+ 			i += olen;
+ 		}
+ 		if (type == 1) {
+-			ud_dhcp_reply(so, req, 2);      /* DHCPOFFER */
++			ud_dhcp_reply(req, 2);          /* DHCPOFFER */
+ 		} else if (type == 3) {
+-			ud_dhcp_reply(so, req, 5);      /* DHCPACK */
++			ud_dhcp_reply(req, 5);          /* DHCPACK */
+ 		}
+ 	}
+ }
