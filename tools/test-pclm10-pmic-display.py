@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0181-flame-pclm10-framebuffer-source-map.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0183-flame-pclm10-rndis-media-notify-thread.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -167,9 +167,12 @@ int main(void) {
         self.assertIn("(raw %u B)", src)
         self.assertIn("ud_ip_csum(ip, 20)", src)
         self.assertIn("a->sin_addr.s_addr = htonl(0xc0a807ff);", src)
-        # 0178's media indication stalled the shared EP0/event thread and
-        # killed the serial console; 0180 removes it (raw DHCP stays).
-        self.assertNotIn("media_pending", src)
+        # 0183 queues MEDIA_CONNECT after the filter SET but starts the ep2
+        # notification from a separate thread; 0178's EP0-side notify
+        # stalled the shared event thread and killed the serial console.
+        self.assertIn("ud_media_start();", src)
+        self.assertIn("media connect notify (thread)", src)
+        self.assertIn("media_pending", src)
         # DWC3 EP0 OUT only completes a short data stage when the TRB
         # covers a full 64-byte max-packet slot (0173's 24-byte INIT
         # never produced XferComplete).
@@ -185,7 +188,7 @@ int main(void) {
         # so an App Library split can be attributed before guessing.
         self.assertIn('PE_parse_boot_argn("sweetfb_map_src"', src)
         self.assertIn("SWEET FB: source map surface", src)
-        self.assertIn("src_elapsed >= 80 * 1000000000ULL", src)
+        self.assertIn("src_elapsed >= 25 * 1000000000ULL", src)
 
     def test_map_quiesces_usb_setup_logs(self):
         fb = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -417,7 +420,7 @@ int main() {
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
             "bsd/dev/sweet_usb.c": ROOT / "work/patch-0180/post/bsd/dev/sweet_usb.c",
             # 0173's preimage includes 0172's framebuffer changes.
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0172/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0182/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:

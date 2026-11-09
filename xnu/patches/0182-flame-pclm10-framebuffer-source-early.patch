@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3235a1f..3ba25e5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1001,8 +1001,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			/* Opt-in source-surface map: shows whether a split/white
+ 			 * background is already in SpringBoard's IOSurface before
+ 			 * the CPU copy, or introduced by the panel path. */
++			/* 25 s after the first present is ~80 s wall: the synthetic
++			 * swipes have reached the App Library, but the source map's
++			 * old 80 s-after-present mark (=135 s wall) caught the lock
++			 * screen because the phone had re-locked. */
+ 			if (src_on && !src_done && layer == 0 &&
+-			    src_elapsed >= 80 * 1000000000ULL) {
++			    src_elapsed >= 25 * 1000000000ULL) {
+ 				src_done = true;
+ 				IOLog("SWEET FB: source map surface %u %ux%u fmt 0x%x bpr %u\n",
+ 				    id, s->width, s->height, s->pixelFormat, s->bytesPerRow);

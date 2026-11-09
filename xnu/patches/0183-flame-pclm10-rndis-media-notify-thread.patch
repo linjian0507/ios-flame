@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e7913d2..2ac8b9a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -336,6 +336,8 @@ static struct {
+ 	uint32_t    resp_len, resp_ready;
+ 	uint32_t    rndis_filter;   /* OID_GEN_CURRENT_PACKET_FILTER */
+ 	bool        data_up;        /* RNDIS data path open (nonzero filter) */
++	bool        media_pending;  /* queue MEDIA_CONNECT after filter SET */
++	volatile bool media_notify; /* thread starts the ep2 notification */
+ 	bool        notify_busy, notify_again;
+ 	/* serial console pipe (the ACM anchor's bulk IN, RNDIS mode):
+ 	 * slog_ready is set once the endpoint is configured; acm_dtr
+@@ -939,6 +941,7 @@ ud_rndis_command(const uint8_t *m, uint32_t len)
+ 			if (ud.rndis_filter && !ud.data_up) {
+ 				ud.data_up = true;
+ 				ud_link_event(true);
++				ud.media_pending = true;
+ 				printf("SWEET USB: rndis data path up\n");
+ 			}
+ 		} else if (oid == RNDIS_OID_802_3_MULTICAST_LIST) {
+@@ -1038,6 +1041,23 @@ ud_setup(void)
+ 				n = ud.resp_len > length ? length : ud.resp_len;
+ 				memcpy(data, ud.resp, n);
+ 				ud.resp_ready = 0;
++				if (ud.media_pending) {
++					/* Queue the f_rndis MEDIA_CONNECT answer after the
++					 * SET completion; the ep2 notification is started
++					 * by ud_media_thread, not inside this EP0 setup
++					 * (that stalled the shared event thread in 0178). */
++					ud.media_pending = false;
++					bzero(ud.resp, 20);
++					ud_rndis_put32(ud.resp, RNDIS_MSG_INDICATE);
++					ud_rndis_put32(ud.resp + 4, 20);
++					ud_rndis_put32(ud.resp + 8, RNDIS_STATUS_MEDIA_CONNECT);
++					ud_rndis_put32(ud.resp + 12, 0);
++					ud_rndis_put32(ud.resp + 16, 0);
++					ud.resp_len = 20;
++					ud.resp_ready = 1;
++					ud.media_notify = true;
++					printf("SWEET USB: rndis media connect queued\n");
++				}
+ 			} else {
+ 				ok = false;   /* nothing queued: stall, as f_rndis does */
+ 			}
+@@ -1619,6 +1639,32 @@ ud_dhcp_start(void)
+ 	}
+ }
+ 
++/* 0178 queued MEDIA_CONNECT and called ud_rndis_notify() from the EP0
++ * GET handler; the shared event thread then stopped servicing the ACM
++ * serial console. Keep the queueing in EP0, but start the ep2 transfer
++ * from this separate thread. */
++static void
++ud_media_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		if (ud.media_notify) {
++			ud.media_notify = false;
++			ud_rndis_notify();
++			printf("SWEET USB: media connect notify (thread)\n");
++		}
++		ud_sleep_ms(20);
++	}
++}
++
++static void
++ud_media_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(ud_media_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -2505,6 +2551,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		sweet_files_start();    /* tcp 2223: bsd/dev/sweet_files.c */
+ 		if (ud.rndis) {
+ 			ud_dhcp_start();    /* host gets 192.168.7.1/24 */
++			ud_media_start();   /* ep2 MEDIA_CONNECT, off the EP0 thread */
+ 		}
+ 	}
+ }
