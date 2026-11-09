@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0179-flame-pclm10-rndis-raw-dhcp.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0180-flame-pclm10-rndis-drop-media-indicate.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -167,8 +167,9 @@ int main(void) {
         self.assertIn("(raw %u B)", src)
         self.assertIn("ud_ip_csum(ip, 20)", src)
         self.assertIn("a->sin_addr.s_addr = htonl(0xc0a807ff);", src)
-        self.assertIn("RNDIS_STATUS_MEDIA_CONNECT    0x4001000bu", src)
-        self.assertIn("rndis media connect indication queued", src)
+        # 0178's media indication stalled the shared EP0/event thread and
+        # killed the serial console; 0180 removes it (raw DHCP stays).
+        self.assertNotIn("media_pending", src)
         # DWC3 EP0 OUT only completes a short data stage when the TRB
         # covers a full 64-byte max-packet slot (0173's 24-byte INIT
         # never produced XferComplete).
@@ -406,7 +407,7 @@ int main() {
             "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_s3706.c",
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
-            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0178/post/bsd/dev/sweet_usb.c",
+            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0179/post/bsd/dev/sweet_usb.c",
             # 0173's preimage includes 0172's framebuffer changes.
             "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0172/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }

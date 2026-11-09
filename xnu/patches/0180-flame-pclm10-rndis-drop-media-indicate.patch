@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6a71f4a..e7913d2 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -336,7 +336,6 @@ static struct {
+ 	uint32_t    resp_len, resp_ready;
+ 	uint32_t    rndis_filter;   /* OID_GEN_CURRENT_PACKET_FILTER */
+ 	bool        data_up;        /* RNDIS data path open (nonzero filter) */
+-	bool        media_pending;  /* queue MEDIA_CONNECT after filter SET */
+ 	bool        notify_busy, notify_again;
+ 	/* serial console pipe (the ACM anchor's bulk IN, RNDIS mode):
+ 	 * slog_ready is set once the endpoint is configured; acm_dtr
+@@ -940,7 +939,6 @@ ud_rndis_command(const uint8_t *m, uint32_t len)
+ 			if (ud.rndis_filter && !ud.data_up) {
+ 				ud.data_up = true;
+ 				ud_link_event(true);
+-				ud.media_pending = true;
+ 				printf("SWEET USB: rndis data path up\n");
+ 			}
+ 		} else if (oid == RNDIS_OID_802_3_MULTICAST_LIST) {
+@@ -1040,22 +1038,6 @@ ud_setup(void)
+ 				n = ud.resp_len > length ? length : ud.resp_len;
+ 				memcpy(data, ud.resp, n);
+ 				ud.resp_ready = 0;
+-				/* Linux f_rndis sends RNDIS_MSG_INDICATE(MEDIA_CONNECT)
+-				 * when the link opens; Windows starts the receive
+-				 * path from it even though the miniport is already Up. */
+-				if (ud.media_pending) {
+-					ud.media_pending = false;
+-					bzero(ud.resp, 20);
+-					ud_rndis_put32(ud.resp, RNDIS_MSG_INDICATE);
+-					ud_rndis_put32(ud.resp + 4, 20);
+-					ud_rndis_put32(ud.resp + 8, RNDIS_STATUS_MEDIA_CONNECT);
+-					ud_rndis_put32(ud.resp + 12, 0);
+-					ud_rndis_put32(ud.resp + 16, 0);
+-					ud.resp_len = 20;
+-					ud.resp_ready = 1;
+-					ud_rndis_notify();
+-					printf("SWEET USB: rndis media connect indication queued\n");
+-				}
+ 			} else {
+ 				ok = false;   /* nothing queued: stall, as f_rndis does */
+ 			}
