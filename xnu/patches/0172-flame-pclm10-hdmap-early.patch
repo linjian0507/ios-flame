@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e75d406..f09c327 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -272,7 +272,7 @@ static bool sweet_fb_hd_active;
+ static void
+ sweet_fb_map_hd_emit(void)
+ {
+-	if (!sweet_fb_hd_active || ++sweet_fb_hd_tick < 16) {
++	if (!sweet_fb_hd_active || ++sweet_fb_hd_tick < 8) {
+ 		return;
+ 	}
+ 	sweet_fb_hd_tick = 0;
+@@ -634,7 +634,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t elapsed_ns = 0;
+ 	absolutetime_to_nanoseconds(now - map_start, &elapsed_ns);
+ 	if (hd_on && !(map_marks & (1u << 31)) &&
+-	    elapsed_ns >= 110 * 1000000000ULL) {
++	    elapsed_ns >= 80 * 1000000000ULL) {
+ 		map_marks |= 1u << 31;
+ 		sweet_fb_dump_map_hd((const uint8_t *)fb->fPixels,
+ 		    fb->fWidth, fb->fHeight, fb->fRowBytes);
