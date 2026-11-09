@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f6aa8aa..bc7ee25 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -330,6 +330,7 @@ static struct {
+ 	 * slot is enough; the notification is coalesced. */
+ 	int         rndis;          /* protocol switch, set once at probe */
+ 	uint32_t    encmd_len;      /* pending SEND_ENCAPSULATED_COMMAND data */
++	uint32_t    encmd_xlen;     /* its EP0 OUT TRB length (64-byte rounded) */
+ 	uint8_t     resp[512];      /* queued GET_ENCAPSULATED_RESPONSE answer */
+ 	uint32_t    resp_len, resp_ready;
+ 	uint32_t    rndis_filter;   /* OID_GEN_CURRENT_PACKET_FILTER */
+@@ -869,6 +870,7 @@ ud_rndis_command(const uint8_t *m, uint32_t len)
+ 	uint8_t *r = ud.resp;
+ 
+ 	if (len < 8) {
++		printf("SWEET USB: rndis short msg len %u\n", len);
+ 		return;
+ 	}
+ 	printf("SWEET USB: rndis msg %u len %u\n", type, len);
+@@ -1117,6 +1119,7 @@ ud_setup(void)
+ 		 * (0173). Round up to the 64-byte control max packet; the
+ 		 * completion side clamps the count back to encmd_len. */
+ 		uint32_t xlen = ud.encmd_len ? ((ud.encmd_len + 63) & ~63u) : 64;
++		ud.encmd_xlen = xlen;
+ 		ud_start(0, UD_DATA, xlen, TRBCTL_DATA);
+ 	}
+ }
+@@ -1499,13 +1502,18 @@ ud_event(uint32_t ev)
+ 				    (volatile uint32_t *)(ud.dma + UD_TRB_OUT);
+ 				uint32_t got;
+ 				ud_sync(UD_TRB_OUT, 16);
+-				got = ud.encmd_len - (t[2] & 0xffffff);
++				/* t[2]'s low 24 bits are the residual of the rounded
++				 * TRB, not of encmd_len: a 32-byte SEND in a 64-byte
++				 * TRB leaves 32, which the old formula subtracted from
++				 * 32 and reported as a zero-byte message. */
++				got = ud.encmd_xlen ? ud.encmd_xlen - (t[2] & 0xffffff) : ud.encmd_len;
+ 				if (got > ud.encmd_len) {
+ 					got = ud.encmd_len;
+ 				}
+ 				ud_sync(UD_DATA, got);
+ 				ud_rndis_command((const uint8_t *)(ud.dma + UD_DATA), got);
+ 				ud.encmd_len = 0;
++				ud.encmd_xlen = 0;
+ 			}
+ 			ud.state = EP0_WAIT_STATUS3;
+ 			break;
