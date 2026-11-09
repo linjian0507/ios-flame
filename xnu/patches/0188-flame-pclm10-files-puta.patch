@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index e78070b..e291171 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -196,6 +196,44 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
+ 	return err;
+ }
+ 
++/*
++ * Chunked upload: write exactly size bytes at off0, creating the file if
++ * needed and never truncating it. A host-side installer sends a large
++ * bundle in 1 MiB chunks, one connection each, so the USB receive path
++ * never has to hold a multi-megabyte stream.
++ */
++static int
++sf_put_at(socket_t so, const char *path, int mode, uint64_t off0, uint64_t size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, O_CREAT | FWRITE, mode & 07777, 0, &vp, ctx);
++	uint64_t done = 0;
++	while (!err && done < size) {
++		size_t chunk = (size_t)MIN((uint64_t)SF_BUF, size - done);
++		int rerr = sf_recv_all(so, sf_buf, chunk);
++		if (rerr) {
++			err = rerr;
++			break;
++		}
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, sf_buf, (int)chunk, (off_t)(off0 + done),
++		    UIO_SYSSPACE, IO_UNIT, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx));
++		if (!err && resid) {
++			err = EIO;
++		}
++		done += chunk;
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FWRITE, ctx);
++	}
++	if (!err) {
++		err = sf_setattr(path, mode, true);
++	}
++	return err;
++}
++
+ static int
+ sf_get(socket_t so, const char *path)
+ {
+@@ -277,6 +315,23 @@ sf_handle(socket_t so)
+ 		return;
+ 	}
+ 	a[0] = b[0] = 0;
++	if (!strncmp(line, "PUTA ", 5)) {
++		unsigned mode = 0644;
++		char *p = line + 5, *sp = strchr(p, ' ');
++		if (!sp || (size_t)(sp - p) >= sizeof(a)) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		memcpy(a, p, (size_t)(sp - p));
++		a[sp - p] = 0;
++		mode = (unsigned)strtoul(sp + 1, &p, 8);
++		unsigned long long off = strtoul(p, &p, 10);
++		n = sf_dec(p);
++		err = sf_put_at(so, a, (int)mode, off, n);
++		printf("SWEET FILES: PUTA %s %o %llu %llu -> %d\n", a, mode, off, n, err);
++		sf_reply(so, err, n, true);
++		return;
++	}
+ 	if (!strncmp(line, "PUT ", 4)) {
+ 		unsigned mode = 0644;
+ 		char *p = line + 4, *sp = strchr(p, ' ');

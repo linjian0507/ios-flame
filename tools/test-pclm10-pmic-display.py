@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0187-flame-pclm10-ufs-lun.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0188-flame-pclm10-files-puta.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -200,6 +200,18 @@ int main(void) {
         self.assertIn("ufs_read_blocks(first + lba", body)
         self.assertIn("lck_mtx_lock(&sweet_ufs_lock);", body)
         self.assertNotIn("ufs_write_blocks", body)
+
+    def test_chunked_put_is_offset_write(self):
+        # 0188: a large bundle is sent in 1 MiB chunks, one connection each;
+        # PUTA writes at an explicit offset and must not truncate the file.
+        files = (ACTIVE_SOURCE / "bsd/dev/sweet_files.c").read_text(encoding="utf-8")
+        self.assertIn("PUTA ", files)
+        self.assertIn("unsigned long long off = strtoul(p, &p, 10);", files)
+        body = extract_function(files, "sf_put_at")
+        self.assertIn("vnode_open(path, O_CREAT | FWRITE", body)
+        self.assertIn("(off_t)(off0 + done)", body)
+        self.assertNotIn("vnode_setsize", body)
+        self.assertNotIn("O_TRUNC", body)
 
     def test_source_map_is_opt_in(self):
         src = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -438,8 +450,8 @@ int main() {
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
             "bsd/dev/sweet_usb.c": ROOT / "work/patch-0183/post/bsd/dev/sweet_usb.c",
-            "bsd/dev/sweet_files.c": ROOT / "work/patch-0186/post/bsd/dev/sweet_files.c",
-            "bsd/dev/sweet_ufs.c": ROOT / "work/patch-0186/post/bsd/dev/sweet_ufs.c",
+            "bsd/dev/sweet_files.c": ROOT / "work/patch-0187/post/bsd/dev/sweet_files.c",
+            "bsd/dev/sweet_ufs.c": ROOT / "work/patch-0187/post/bsd/dev/sweet_ufs.c",
             # 0173's preimage includes 0172's framebuffer changes.
             "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0182/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
