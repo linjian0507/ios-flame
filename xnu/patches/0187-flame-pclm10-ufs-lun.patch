@@ -1,0 +1,233 @@
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index 8180ef6..e78070b 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -36,8 +36,9 @@
+ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+ extern int sweet_vfs_unlink(const char *path);
+-extern int sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len);
+-extern int sweet_ufs_list_partitions(char *buf, size_t len);
++extern int sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len, int lun);
++extern int sweet_ufs_list_partitions(char *buf, size_t len, int lun);
++extern int sweet_ufs_read_lun(int lun, uint64_t off, void *buf, size_t len);
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_files_start(void);
+ 
+@@ -313,8 +314,16 @@ sf_handle(socket_t so)
+ 	}
+ 	if (!strncmp(line, "LISTUFS", 7)) {
+ 		char *lp = sf_buf;
++		char *p = line + 7;
++		int lun = 0;
++		while (*p == ' ') {
++			p++;
++		}
++		if (*p) {
++			lun = (int)strtoul(p, &p, 10);
++		}
+ 		lp[0] = 0;
+-		err = sweet_ufs_list_partitions(lp, SF_BUF);
++		err = sweet_ufs_list_partitions(lp, SF_BUF, lun);
+ 		if (!err) {
+ 			size_t ln = strlen(lp);
+ 			sf_reply(so, 0, ln, true);
+@@ -326,30 +335,82 @@ sf_handle(socket_t so)
+ 		return;
+ 	}
+ 	if (!strncmp(line, "READUFS ", 8)) {
+-		/* Raw read-only view of a GPT partition ("system", "vendor") for
+-		 * host-side ext4/firmware extraction. The kernel UFS layer does
+-		 * the block reads under its own lock. */
+-		char *p = line + 8, *sp = strchr(p, ' ');
+-		if (!sp || (size_t)(sp - p) >= sizeof(a)) {
++		/* Raw read-only view of a GPT partition for host-side ext4
++		 * extraction. New form: READUFS <lun> <name> <off> <len>;
++		 * the old form without a leading number keeps LUN 0. */
++		char *p = line + 8, *sp;
++		char *name;
++		int lun = 0, numeric = 1;
++		while (*p == ' ') {
++			p++;
++		}
++		sp = strchr(p, ' ');
++		if (!sp) {
+ 			sf_reply(so, EINVAL, 0, false);
+ 			return;
+ 		}
+-		memcpy(a, p, (size_t)(sp - p));
+-		a[sp - p] = 0;
++		for (char *q = p; q < sp; q++) {
++			if (*q < '0' || *q > '9') {
++				numeric = 0;
++				break;
++			}
++		}
++		name = p;
++		if (numeric) {
++			lun = (int)strtoul(p, &p, 10);
++			while (*p == ' ') {
++				p++;
++			}
++			name = p;
++			sp = strchr(p, ' ');
++			if (!sp) {
++				sf_reply(so, EINVAL, 0, false);
++				return;
++			}
++		}
++		if ((size_t)(sp - name) >= sizeof(a)) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		memcpy(a, name, (size_t)(sp - name));
++		a[sp - name] = 0;
+ 		unsigned long long off = strtoul(sp + 1, &p, 10);
+ 		n = sf_dec(p);
+ 		if (n == 0 || n > SF_BUF) {
+ 			sf_reply(so, EINVAL, 0, false);
+ 			return;
+ 		}
+-		err = sweet_ufs_read_partition(a, off, sf_buf, (size_t)n);
++		err = sweet_ufs_read_partition(a, off, sf_buf, (size_t)n, lun);
++		if (!err) {
++			sf_reply(so, 0, n, true);
++			err = sf_send(so, sf_buf, (size_t)n);
++		} else {
++			sf_reply(so, err, 0, false);
++		}
++		printf("SWEET FILES: READUFS %d %s %llu %llu -> %d\n", lun, a, off, n, err);
++		return;
++	}
++	if (!strncmp(line, "READLUN ", 8)) {
++		char *p = line + 8;
++		int lun = (int)strtoul(p, &p, 10);
++		if (*p != ' ') {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		unsigned long long off = strtoul(p + 1, &p, 10);
++		n = sf_dec(p);
++		if (n == 0 || n > SF_BUF) {
++			sf_reply(so, EINVAL, 0, false);
++			return;
++		}
++		err = sweet_ufs_read_lun(lun, off, sf_buf, (size_t)n);
+ 		if (!err) {
+ 			sf_reply(so, 0, n, true);
+ 			err = sf_send(so, sf_buf, (size_t)n);
+ 		} else {
+ 			sf_reply(so, err, 0, false);
+ 		}
+-		printf("SWEET FILES: READUFS %s %llu %llu -> %d\n", a, off, n, err);
++		printf("SWEET FILES: READLUN %d %llu %llu -> %d\n", lun, off, n, err);
+ 		return;
+ 	}
+ 	char *sp = strchr(line, ' ');
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 4993dfe..994842e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -366,20 +366,28 @@ ufs_find_partition(const char *want)
+  * userdata bounds are saved and restored around the GPT lookup.
+  */
+ int
+-sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len)
++sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len,
++    int lun)
+ {
+ 	uint64_t save_first, save_n, first, n;
++	uint8_t save_lun;
+ 	int error;
+ 
+ 	if (len == 0) {
+ 		return 0;
+ 	}
++	if (lun < 0 || lun > 7) {
++		return EINVAL;
++	}
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	save_first = su.first_block;
+ 	save_n = su.nblocks;
++	save_lun = su.lun;
++	su.lun = (uint8_t)lun;
+ 	error = ufs_find_partition(name);
+ 	first = su.first_block;
+ 	n = su.nblocks;
++	su.lun = save_lun;
+ 	su.first_block = save_first;
+ 	su.nblocks = save_n;
+ 	if (!error && (off > n * UFS_BLOCK || len > n * UFS_BLOCK - off)) {
+@@ -409,18 +417,24 @@ sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len)
+  * sweet_ufs_lock so the root I/O cannot race the GPT reads.
+  */
+ int
+-sweet_ufs_list_partitions(char *buf, size_t len)
++sweet_ufs_list_partitions(char *buf, size_t len, int lun)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	uint64_t entry_lba;
+ 	uint32_t nent, esz;
++	uint8_t save_lun;
+ 	int error, used = 0;
+ 
+ 	if (len == 0) {
+ 		return EINVAL;
+ 	}
++	if (lun < 0 || lun > 7) {
++		return EINVAL;
++	}
+ 	buf[0] = 0;
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	save_lun = su.lun;
++	su.lun = (uint8_t)lun;
+ 	error = ufs_read_blocks(1, 1);
+ 	if (!error && memcmp(b, "EFI PART", 8) != 0) {
+ 		error = ENXIO;
+@@ -467,6 +481,46 @@ sweet_ufs_list_partitions(char *buf, size_t len)
+ 			break;
+ 		}
+ 	}
++	su.lun = save_lun;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++/*
++ * Raw read from a UFS LUN, for partitions that have no GPT entry (the
++ * PCLM10 vendor image lives on a non-LUN0 unit). Reads are absolute LBA
++ * on that unit and read-only; the caller supplies the size.
++ */
++int
++sweet_ufs_read_lun(int lun, uint64_t off, void *buf, size_t len)
++{
++	uint8_t save_lun;
++	int error = 0;
++
++	if (len == 0) {
++		return 0;
++	}
++	if (lun < 0 || lun > 7) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	save_lun = su.lun;
++	su.lun = (uint8_t)lun;
++	for (size_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN((uint64_t)len - done,
++		    (uint64_t)BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		error = ufs_read_blocks(lba, blocks);
++		if (!error) {
++			memcpy((char *)buf + done,
++			    (const char *)(su.dma + DMA_BOUNCE) + skip, want);
++		}
++		done += want;
++	}
++	su.lun = save_lun;
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	return error;
+ }

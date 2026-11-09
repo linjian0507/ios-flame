@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0186-flame-pclm10-listufs.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0187-flame-pclm10-ufs-lun.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -187,11 +187,14 @@ int main(void) {
         ufs = (ACTIVE_SOURCE / "bsd/dev/sweet_ufs.c").read_text(encoding="utf-8")
         self.assertIn("READUFS ", files)
         self.assertIn("LISTUFS", files)
+        self.assertIn("READLUN ", files)
         self.assertIn("#define SF_BUF  (1024 * 1024)", files)
         self.assertIn("sweet_ufs_read_partition", files)
         self.assertIn("sweet_ufs_list_partitions", files)
+        self.assertIn("sweet_ufs_read_lun", files)
         self.assertIn("sweet_ufs_read_partition", ufs)
         self.assertIn("sweet_ufs_list_partitions", ufs)
+        self.assertIn("sweet_ufs_read_lun", ufs)
         body = extract_function(ufs, "sweet_ufs_read_partition")
         self.assertIn("ufs_find_partition(name)", body)
         self.assertIn("ufs_read_blocks(first + lba", body)
@@ -435,8 +438,8 @@ int main() {
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
             "bsd/dev/sweet_usb.c": ROOT / "work/patch-0183/post/bsd/dev/sweet_usb.c",
-            "bsd/dev/sweet_files.c": ROOT / "work/patch-0185/post/bsd/dev/sweet_files.c",
-            "bsd/dev/sweet_ufs.c": ROOT / "work/patch-0184/post/bsd/dev/sweet_ufs.c",
+            "bsd/dev/sweet_files.c": ROOT / "work/patch-0186/post/bsd/dev/sweet_files.c",
+            "bsd/dev/sweet_ufs.c": ROOT / "work/patch-0186/post/bsd/dev/sweet_ufs.c",
             # 0173's preimage includes 0172's framebuffer changes.
             "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0182/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
