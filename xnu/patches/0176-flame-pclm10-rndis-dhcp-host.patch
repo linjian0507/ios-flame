@@ -1,0 +1,188 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index bc7ee25..88e5575 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1346,10 +1346,10 @@ ud_if_detach(ifnet_t ifp __unused)
+ {
+ }
+ 
+-/* ue0, 169.254.7.2/16: the Windows host has no administrator to set a
+- * static address, but it assigns an APIPA 169.254/16 address to the RNDIS
+- * adapter automatically. Link-local keeps 169.254.7.2 on-link for that
+- * host, so TCP/UDP reach us with no host-side configuration. */
++/* ue0, 192.168.7.2/24: the kernel runs a DHCP server on this link, so the
++ * unprivileged Windows host receives 192.168.7.1/24 and a connected route
++ * without an administrator. A 169.254/16 address would lose to this PC's
++ * Tailscale route for the same prefix. */
+ static void
+ ud_if_create(void)
+ {
+@@ -1408,20 +1408,154 @@ ud_if_create(void)
+ 		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xa9fe0702);         /* 169.254.7.2 */
++		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
+ 		a = (struct sockaddr_in *)&ifra.ifra_mask;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xffff0000);
++		a->sin_addr.s_addr = htonl(0xffffff00);
+ 		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xa9feffff);
++		a->sin_addr.s_addr = htonl(0xc0a807ff);
+ 		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+ 		sock_close(so);
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	printf("SWEET USB: ue0 169.254.7.2/16 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++}
++
++/* ---- DHCP server for the host ----------------------------------------
++ * The unprivileged Windows host cannot set a static address on the RNDIS
++ * miniport. Without a server it falls back to 169.254/16, which this PC
++ * already routes through Tailscale, so the phone is unreachable. Four
++ * options (message type, server id, lease, mask/router/DNS/broadcast)
++ * are enough for the in-box DHCP client to take 192.168.7.1/24 and install
++ * the connected route to 192.168.7.2.
++ */
++static void
++ud_dhcp_reply(socket_t so, const uint8_t *req, uint8_t type)
++{
++	uint8_t rep[300];
++	uint8_t *o;
++	struct sockaddr_in to;
++	struct iovec iov;
++	struct msghdr msg;
++	size_t sent = 0;
++
++	bzero(rep, sizeof(rep));
++	rep[0] = 2;                     /* BOOTREPLY */
++	rep[1] = 1;                     /* Ethernet */
++	rep[2] = 6;                     /* hlen */
++	memcpy(rep + 4, req + 4, 4);    /* xid */
++	rep[10] = req[10];
++	rep[11] = req[11];
++	rep[16] = 192; rep[17] = 168; rep[18] = 7; rep[19] = 1; /* yiaddr */
++	rep[20] = 192; rep[21] = 168; rep[22] = 7; rep[23] = 2; /* siaddr */
++	memcpy(rep + 28, req + 28, 16); /* chaddr */
++	rep[236] = 0x63; rep[237] = 0x82; rep[238] = 0x53; rep[239] = 0x63;
++	o = rep + 240;
++	*o++ = 53; *o++ = 1; *o++ = type;
++	*o++ = 54; *o++ = 4; *o++ = 192; *o++ = 168; *o++ = 7; *o++ = 2;
++	*o++ = 51; *o++ = 4; *o++ = 0; *o++ = 1; *o++ = 0x51; *o++ = 0x80; /* 86400 */
++	*o++ = 1;  *o++ = 4; *o++ = 255; *o++ = 255; *o++ = 255; *o++ = 0;
++	*o++ = 3;  *o++ = 4; *o++ = 192; *o++ = 168; *o++ = 7; *o++ = 2;
++	*o++ = 6;  *o++ = 4; *o++ = 192; *o++ = 168; *o++ = 7; *o++ = 2;
++	*o++ = 28; *o++ = 4; *o++ = 192; *o++ = 168; *o++ = 7; *o++ = 255;
++	*o++ = 58; *o++ = 4; *o++ = 0; *o++ = 0; *o++ = 0xa8; *o++ = 0xc0; /* 43200 */
++	*o++ = 59; *o++ = 4; *o++ = 0; *o++ = 1; *o++ = 0x27; *o++ = 0x50; /* 75600 */
++	*o++ = 255;
++	if ((size_t)(o - rep) < sizeof(rep)) {
++		o = rep + sizeof(rep);
++	}
++	bzero(&to, sizeof(to));
++	to.sin_len = sizeof(to);
++	to.sin_family = AF_INET;
++	to.sin_port = htons(68);
++	to.sin_addr.s_addr = htonl(0xc0a807ff);         /* 192.168.7.255 */
++	iov.iov_base = rep;
++	iov.iov_len = (size_t)(o - rep);
++	bzero(&msg, sizeof(msg));
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	msg.msg_name = &to;
++	msg.msg_namelen = sizeof(to);
++	errno_t err = sock_send(so, &msg, 0, &sent);
++	printf("SWEET DHCP: %s for %02x:%02x:%02x:%02x:%02x:%02x (send %d, %u B)\n",
++	    type == 2 ? "OFFER" : "ACK", req[28], req[29], req[30], req[31], req[32],
++	    req[33], err, (unsigned)sent);
++}
++
++static void
++ud_dhcp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	socket_t so = NULL;
++	struct sockaddr_in me;
++	int one = 1;
++	uint8_t req[1024];
++
++	for (;;) {
++		if (sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) == 0 &&
++		    sock_setsockopt(so, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one)) == 0) {
++			bzero(&me, sizeof(me));
++			me.sin_len = sizeof(me);
++			me.sin_family = AF_INET;
++			me.sin_port = htons(67);
++			me.sin_addr.s_addr = htonl(INADDR_ANY);
++			if (sock_bind(so, (struct sockaddr *)&me) == 0) {
++				break;
++			}
++		}
++		if (so != NULL) {
++			sock_close(so);
++			so = NULL;
++		}
++		ud_sleep_ms(1000);
++	}
++	printf("SWEET DHCP: listening on udp 67\n");
++	for (;;) {
++		struct iovec iov = { .iov_base = req, .iov_len = sizeof(req) };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t got = 0;
++		if (sock_receive(so, &msg, 0, &got) != 0 || got < 240) {
++			ud_sleep_ms(10);
++			continue;
++		}
++		if (req[0] != 1 || req[236] != 0x63 || req[237] != 0x82 ||
++		    req[238] != 0x53 || req[239] != 0x63) {
++			continue;
++		}
++		uint8_t type = 0;
++		for (size_t i = 240; i + 1 < got; ) {
++			uint8_t code = req[i++], olen = req[i++];
++			if (code == 0) {
++				continue;
++			}
++			if (code == 255) {
++				break;
++			}
++			if (i + olen > got) {
++				break;
++			}
++			if (code == 53 && olen >= 1) {
++				type = req[i];
++			}
++			i += olen;
++		}
++		if (type == 1) {
++			ud_dhcp_reply(so, req, 2);      /* DHCPOFFER */
++		} else if (type == 3) {
++			ud_dhcp_reply(so, req, 5);      /* DHCPACK */
++		}
++	}
++}
++
++static void
++ud_dhcp_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(ud_dhcp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ static void
+@@ -2291,6 +2425,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (ud.ifp != NULL) {
+ 		extern void sweet_files_start(void);
+ 		sweet_files_start();    /* tcp 2223: bsd/dev/sweet_files.c */
++		if (ud.rndis) {
++			ud_dhcp_start();    /* host gets 192.168.7.1/24 */
++		}
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
