@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 36778d5..e75d406 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -262,8 +262,8 @@ static unsigned sweet_fb_map_tick;
+ int sweet_map_quiet;
+ 
+ /* High-colour 96x213 RGB565 map for judging gradients and icons. */
+-#define SWEET_FB_HD_W 96
+-#define SWEET_FB_HD_H 213
++#define SWEET_FB_HD_W 56
++#define SWEET_FB_HD_H 120
+ static uint16_t sweet_fb_hd_pixels[SWEET_FB_HD_W * SWEET_FB_HD_H];
+ static unsigned sweet_fb_hd_row;
+ static unsigned sweet_fb_hd_tick;
+@@ -272,7 +272,7 @@ static bool sweet_fb_hd_active;
+ static void
+ sweet_fb_map_hd_emit(void)
+ {
+-	if (!sweet_fb_hd_active || ++sweet_fb_hd_tick < 6) {
++	if (!sweet_fb_hd_active || ++sweet_fb_hd_tick < 16) {
+ 		return;
+ 	}
+ 	sweet_fb_hd_tick = 0;

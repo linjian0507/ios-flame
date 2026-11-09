@@ -11,9 +11,9 @@ import zlib
 from pathlib import Path
 
 LINE = re.compile(r"SWEET FB MAP (\d+) (\d+) ([0-9a-f]+)", re.I)
-HDLINE = re.compile(r"SWEET FB HDMAP (\d+) ([0-9a-f]+)", re.I)
+HDLINE = re.compile(r"SWEET FB HDMAP (\d+) ([0-9a-f]{384})", re.I)
 WIDTH, HEIGHT = 48, 106
-HDW, HDH = 96, 213
+HDW, HDH = 56, 120
 
 
 def parse(text):
@@ -28,8 +28,21 @@ def parse(text):
 
 def parse_hd(text):
     rows = {}
-    for m in HDLINE.finditer(text):
-        row, data = int(m[1]), m[2].lower()
+    for line in text.splitlines():
+        m = re.search(r"SWEET FB HDMAP (\d+)", line, re.I)
+        if not m:
+            continue
+        row = int(m[1])
+        # Console writers can interleave another log line inside ours.
+        # Our hex payload is the only run of long lowercase-hex chunks,
+        # so concatenate those and ignore the interleaved text.
+        runs = re.findall(r"[0-9a-f]{32,}", line[m.end():], re.I)
+        parts = []
+        for run in runs:
+            if len(run) % 4:
+                run = run[len(run) % 4:]
+            parts.append(run)
+        data = "".join(parts)[:HDW * 4]
         if row >= HDH or len(data) != HDW * 4:
             continue
         rows[row] = bytes.fromhex(data)
