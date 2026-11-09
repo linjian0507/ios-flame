@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 29b269a..f6aa8aa 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1110,8 +1110,14 @@ ud_setup(void)
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+ 		/* RNDIS: the SEND_ENCAPSULATED_COMMAND message, processed
+-		 * when the data stage completes; otherwise unused. */
+-		ud_start(0, UD_DATA, ud.encmd_len ? ud.encmd_len : 64, TRBCTL_DATA);
++		 * when the data stage completes; otherwise unused.
++		 * DWC3 EP0 OUT completes a short packet only when the TRB
++		 * covers a full max-packet slot: a 24-byte RNDIS INIT with a
++		 * 24-byte TRB produced XferNotReady twice and never completed
++		 * (0173). Round up to the 64-byte control max packet; the
++		 * completion side clamps the count back to encmd_len. */
++		uint32_t xlen = ud.encmd_len ? ((ud.encmd_len + 63) & ~63u) : 64;
++		ud_start(0, UD_DATA, xlen, TRBCTL_DATA);
+ 	}
+ }
+ 
