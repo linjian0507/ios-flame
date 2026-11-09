@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index 824af76..8180ef6 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -37,6 +37,7 @@ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+ extern int sweet_vfs_unlink(const char *path);
+ extern int sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len);
++extern int sweet_ufs_list_partitions(char *buf, size_t len);
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_files_start(void);
+ 
+@@ -310,6 +311,20 @@ sf_handle(socket_t so)
+ 		printf("SWEET FILES: READ %s %llu %llu -> %d\n", a, off, n, err);
+ 		return;
+ 	}
++	if (!strncmp(line, "LISTUFS", 7)) {
++		char *lp = sf_buf;
++		lp[0] = 0;
++		err = sweet_ufs_list_partitions(lp, SF_BUF);
++		if (!err) {
++			size_t ln = strlen(lp);
++			sf_reply(so, 0, ln, true);
++			err = sf_send(so, lp, ln);
++		} else {
++			sf_reply(so, err, 0, false);
++		}
++		printf("SWEET FILES: LISTUFS -> %d\n", err);
++		return;
++	}
+ 	if (!strncmp(line, "READUFS ", 8)) {
+ 		/* Raw read-only view of a GPT partition ("system", "vendor") for
+ 		 * host-side ext4/firmware extraction. The kernel UFS layer does
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e32a46b..4993dfe 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -403,6 +403,74 @@ sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, size_t len)
+ 	return error;
+ }
+ 
++/*
++ * Read-only GPT partition list for the file server: one "name first_blocks
++ * block_count" line per entry. The caller's buffer is filled under
++ * sweet_ufs_lock so the root I/O cannot race the GPT reads.
++ */
++int
++sweet_ufs_list_partitions(char *buf, size_t len)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	int error, used = 0;
++
++	if (len == 0) {
++		return EINVAL;
++	}
++	buf[0] = 0;
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_blocks(1, 1);
++	if (!error && memcmp(b, "EFI PART", 8) != 0) {
++		error = ENXIO;
++	}
++	if (!error) {
++		memcpy(&entry_lba, b + 72, 8);
++		memcpy(&nent, b + 80, 4);
++		memcpy(&esz, b + 84, 4);
++		if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++			error = ENXIO;
++		}
++	}
++	if (!error) {
++		error = ufs_read_blocks(entry_lba,
++		    (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	}
++	for (uint32_t i = 0; !error && i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (name[0] == 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		int n = snprintf(buf + used, len - (size_t)used, "%s %llu %llu\n",
++		    name, first, last >= first ? last - first + 1 : 0);
++		if (n < 0) {
++			error = EIO;
++			break;
++		}
++		used += n;
++		if ((size_t)used >= len) {
++			used = (int)len - 1;
++			break;
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {

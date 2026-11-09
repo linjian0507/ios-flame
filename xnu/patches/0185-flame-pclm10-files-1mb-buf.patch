@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index 2af4ca8..824af76 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -40,7 +40,7 @@ extern int sweet_ufs_read_partition(const char *name, uint64_t off, void *buf, s
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_files_start(void);
+ 
+-#define SF_BUF  (64 * 1024)
++#define SF_BUF  (1024 * 1024)
+ 
+ static char *sf_buf;
+ static int sf_chan;
