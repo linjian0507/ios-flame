@@ -26,6 +26,17 @@ class FbMapTests(unittest.TestCase):
         width, height = struct.unpack(">II", data[16:24])
         self.assertEqual((width, height), (480, 1060))
 
+    def test_hd_parse_and_png(self):
+        rows = "\n".join(f"SWEET FB HDMAP {y} " + "f800" * 96 for y in range(213))
+        hd = module.parse_hd(rows)
+        self.assertEqual(len(hd), 213)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hd.png"
+            module.write_hd_png(hd, path)
+            data = path.read_bytes()
+        width, height = struct.unpack(">II", data[16:24])
+        self.assertEqual((width, height), (480, 1065))
+
     def test_bad_rows_are_ignored(self):
         maps = module.parse("SWEET FB MAP 1 0 ff\nSWEET FB MAP 1 200 " + "00" * 48)
         self.assertEqual(maps, {})

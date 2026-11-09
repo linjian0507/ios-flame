@@ -11,7 +11,9 @@ import zlib
 from pathlib import Path
 
 LINE = re.compile(r"SWEET FB MAP (\d+) (\d+) ([0-9a-f]+)", re.I)
+HDLINE = re.compile(r"SWEET FB HDMAP (\d+) ([0-9a-f]+)", re.I)
 WIDTH, HEIGHT = 48, 106
+HDW, HDH = 96, 213
 
 
 def parse(text):
@@ -22,6 +24,24 @@ def parse(text):
             continue
         maps.setdefault(slot, {})[row] = bytes.fromhex(data)
     return maps
+
+
+def parse_hd(text):
+    rows = {}
+    for m in HDLINE.finditer(text):
+        row, data = int(m[1]), m[2].lower()
+        if row >= HDH or len(data) != HDW * 4:
+            continue
+        rows[row] = bytes.fromhex(data)
+    return rows
+
+
+def rgb565(v):
+    v = int.from_bytes(v, "big")
+    r = (v >> 11) & 31
+    g = (v >> 5) & 63
+    b = v & 31
+    return (r * 255 // 31, g * 255 // 63, b * 255 // 31)
 
 
 def rgb332(v):
@@ -57,13 +77,27 @@ def write_png(maps, slot, path, scale=10):
     path.write_bytes(png(WIDTH * scale, HEIGHT * scale, rows))
 
 
+def write_hd_png(rows, path, scale=5):
+    pixels = []
+    for gy in range(HDH):
+        data = rows.get(gy, bytes(HDW * 2))
+        line = bytearray()
+        for i in range(HDW):
+            r, g, b = rgb565(data[i * 2:i * 2 + 2])
+            line.extend(bytes((r, g, b)) * scale)
+        pixels.extend([bytes(line)] * scale)
+    path.write_bytes(png(HDW * scale, HDH * scale, pixels))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path)
     parser.add_argument("--outdir", type=Path, default=Path("work/fb-maps"))
     args = parser.parse_args()
-    maps = parse(args.capture.read_text(encoding="utf-8", errors="replace"))
-    if not maps:
+    text = args.capture.read_text(encoding="utf-8", errors="replace")
+    maps = parse(text)
+    hd = parse_hd(text)
+    if not maps and not hd:
         print("no SWEET FB MAP rows found")
         return 1
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -74,6 +108,10 @@ def main():
         path = args.outdir / f"panel-slot{slot}.png"
         write_png(maps, slot, path)
         print(f"slot {slot}: rows {len(rows)}/{HEIGHT} nonblack {nonblack}/{len(pixels)} -> {path}")
+    if hd:
+        path = args.outdir / "panel-hd.png"
+        write_hd_png(hd, path)
+        print(f"HD: rows {len(hd)}/{HDH} -> {path}")
     return 0
 
 

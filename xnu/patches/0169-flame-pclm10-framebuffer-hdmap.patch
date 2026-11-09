@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e84dbb4..b41e19d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -258,6 +258,84 @@ static unsigned sweet_fb_map_slot = ~0u;
+ static unsigned sweet_fb_map_row;
+ static unsigned sweet_fb_map_tick;
+ 
++/* High-colour 96x213 RGB565 map for judging gradients and icons. */
++#define SWEET_FB_HD_W 96
++#define SWEET_FB_HD_H 213
++static uint16_t sweet_fb_hd_pixels[SWEET_FB_HD_W * SWEET_FB_HD_H];
++static unsigned sweet_fb_hd_row;
++static unsigned sweet_fb_hd_tick;
++static bool sweet_fb_hd_active;
++
++static void
++sweet_fb_map_hd_emit(void)
++{
++	if (!sweet_fb_hd_active || ++sweet_fb_hd_tick < 6) {
++		return;
++	}
++	sweet_fb_hd_tick = 0;
++	if (sweet_fb_hd_row >= SWEET_FB_HD_H) {
++		sweet_fb_hd_active = false;
++		return;
++	}
++	static const char hex[] = "0123456789abcdef";
++	char line[SWEET_FB_HD_W * 4 + 32];
++	int pos = 0;
++	const uint16_t *src = sweet_fb_hd_pixels + sweet_fb_hd_row * SWEET_FB_HD_W;
++	for (unsigned i = 0; i < SWEET_FB_HD_W; i++) {
++		line[pos++] = hex[(src[i] >> 12) & 15];
++		line[pos++] = hex[(src[i] >> 8) & 15];
++		line[pos++] = hex[(src[i] >> 4) & 15];
++		line[pos++] = hex[src[i] & 15];
++	}
++	line[pos] = 0;
++	IOLog("SWEET FB HDMAP %u %s\n", sweet_fb_hd_row, line);
++	sweet_fb_hd_row++;
++}
++
++static void
++sweet_fb_dump_map_hd(const uint8_t *pixels, uint32_t width, uint32_t height,
++    uint32_t row_bytes)
++{
++	if (pixels == 0 || width < SWEET_FB_HD_W || height < SWEET_FB_HD_H ||
++	    sweet_fb_hd_active) {
++		return;
++	}
++	for (uint32_t gy = 0; gy < SWEET_FB_HD_H; gy++) {
++		uint32_t y0 = (uint32_t)((uint64_t)gy * height / SWEET_FB_HD_H);
++		uint32_t y1 = (uint32_t)((uint64_t)(gy + 1) * height / SWEET_FB_HD_H);
++		if (y1 <= y0) {
++			y1 = y0 + 1;
++		}
++		for (uint32_t gx = 0; gx < SWEET_FB_HD_W; gx++) {
++			uint32_t x0 = (uint32_t)((uint64_t)gx * width / SWEET_FB_HD_W);
++			uint32_t x1 = (uint32_t)((uint64_t)(gx + 1) * width / SWEET_FB_HD_W);
++			uint64_t r = 0, g = 0, b = 0, n = 0;
++			if (x1 <= x0) {
++				x1 = x0 + 1;
++			}
++			for (uint32_t y = y0; y < y1 && y < height; y += 2) {
++				const volatile uint8_t *row = pixels + (uint64_t)y * row_bytes;
++				for (uint32_t x = x0; x < x1 && x < width; x += 2) {
++					const volatile uint8_t *p = row + (uint64_t)x * 4;
++					b += p[0];
++					g += p[1];
++					r += p[2];
++					n++;
++				}
++			}
++			if (n == 0) {
++				n = 1;
++			}
++			sweet_fb_hd_pixels[gy * SWEET_FB_HD_W + gx] =
++			    (uint16_t)((((r / n) >> 3) << 11) |
++			    (((g / n) >> 2) << 5) | ((b / n) >> 3));
++		}
++	}
++	sweet_fb_hd_row = 0;
++	sweet_fb_hd_tick = 0;
++	sweet_fb_hd_active = true;
++}
++
+ /* Paced one row per two vsyncs so the 16 KiB console ring is not
+  * overwritten by SpringBoard's log bursts. */
+ static void
+@@ -538,11 +616,22 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	static uint64_t map_start;
+ 	static unsigned map_marks;
+ 	static const uint64_t marks[] = {75, 150, 210};
++	static int hd_on = -1;
++	if (hd_on < 0) {
++		hd_on = 0;
++		PE_parse_boot_argn("sweetfb_map_hd", &hd_on, sizeof(hd_on));
++	}
+ 	if (map_start == 0) {
+ 		map_start = now;
+ 	}
+ 	uint64_t elapsed_ns = 0;
+ 	absolutetime_to_nanoseconds(now - map_start, &elapsed_ns);
++	if (hd_on && !(map_marks & (1u << 31)) &&
++	    elapsed_ns >= 110 * 1000000000ULL) {
++		map_marks |= 1u << 31;
++		sweet_fb_dump_map_hd((const uint8_t *)fb->fPixels,
++		    fb->fWidth, fb->fHeight, fb->fRowBytes);
++	}
+ 	for (unsigned i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
+ 		if (!(map_marks & (1u << i)) &&
+ 		    elapsed_ns >= marks[i] * 1000000000ULL) {
+@@ -552,6 +641,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 	}
+ 	sweet_fb_map_emit();
++	sweet_fb_map_hd_emit();
+ 	if ((count % 300) == 0) {
+ 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
+ 		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
