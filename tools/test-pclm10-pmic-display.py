@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0172-flame-pclm10-hdmap-early.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0173-flame-pclm10-rndis-standard-ifaces.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -140,6 +140,20 @@ int main(void) {
         candidate = module.args("unixnu-p4-touch-surf10.toml")
         self.assertEqual(sorted(set(candidate) - set(base)), ["sweetsurf10=2"])
         self.assertEqual(sorted(set(base) - set(candidate)), [])
+
+    def test_rndis_uses_standard_cdc_interfaces_and_link_local(self):
+        src = (ACTIVE_SOURCE / "bsd/dev/sweet_usb.c").read_text(encoding="utf-8")
+        # Linux f_rndis / stock Android: the IAD is EF/04/01 (rndiscmp.inf),
+        # but the control and data interfaces keep the CDC classes.
+        self.assertIn("9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 5", src)
+        self.assertIn("9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0", src)
+        self.assertNotIn("9, 4, 0, 0, 1, 0xef, 0x04, 0x01, 5", src)
+        self.assertNotIn("9, 4, 1, 0, 2, 0xef, 0x04, 0x01, 0", src)
+        # No administrator on the Windows host: the phone takes a link-local
+        # address in the APIPA /16 the adapter configures by itself.
+        self.assertIn("htonl(0xa9fe0702)", src)
+        self.assertIn("htonl(0xffff0000)", src)
+        self.assertIn("htonl(0xa9feffff)", src)
 
     def test_map_quiesces_usb_setup_logs(self):
         fb = (ACTIVE_SOURCE / "iokit/Kernel/arm/SweetFramebuffer.cpp").read_text(encoding="utf-8")
@@ -346,7 +360,7 @@ int main() {
         spec.loader.exec_module(module)
         self.assertEqual(sorted(set(module.args("unixnu-p4-touch-pmicdiag.toml")) -
                                 set(module.args("unixnu-p4-touch.toml"))),
-                         ["s3706swipe=40", "sweetfb_compare=1", "sweetfb_map_hd=1"])
+                         ["s3706swipe=35", "sweetfb_compare=1", "sweetfb_map_hd=1"])
 
     @unittest.skipIf(SOURCE_FLAG, "requires the board's DT and on-device log")
     def test_identifies_cpu_center_crop_without_claiming_correct_output(self):
@@ -370,7 +384,8 @@ int main() {
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
             "bsd/dev/sweet_usb.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_usb.c",
-            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/buildtree-0171-r42545717811/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp",
+            # 0173's preimage includes 0172's framebuffer changes.
+            "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0172/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
         preferred = Path(os.environ.get("OPENCODE_TEST_TMP", "/mnt/c/Users/renny/AppData/Local/Temp/opencode"))
         with tempfile.TemporaryDirectory(prefix="pclm10-apply-", dir=str(preferred) if preferred.is_dir() else None) as tmp:

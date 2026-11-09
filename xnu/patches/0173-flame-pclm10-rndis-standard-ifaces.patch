@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 81298d9..29b269a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -525,17 +525,26 @@ static const uint8_t ud_cfg_desc[80] = {
+  * composites always carry a second function for the same reason. The
+  * ACM function needs no driver here: Windows either leaves it alone or
+  * binds usbser to it, and neither touches the RNDIS child.
++ *
++ * The RNDIS function itself keeps Linux f_rndis's interface classes:
++ * the control interface is CDC ACM (02/02/01) and the data interface is
++ * CDC data (0A/00/00). Only the IAD carries EF/04/01, which is what
++ * rndiscmp.inf matches. The earlier descriptors put EF/04/01 on both
++ * interfaces; Windows built the composite and matched the function, but
++ * usb8023.sys failed to start (Code 10) before sending any RNDIS control
++ * message, which is what a driver that cannot find its data interface
++ * does.
+  */
+ static const uint8_t ud_cfg_desc_rndis[142] = {
+ 	9, 2, 142, 0, 4, 1, 0, 0x80, 250,                /* config: 4 interfaces, 500 mA */
+ 	8, 0x0b, 0, 2, 0xef, 0x04, 0x01, 0,             /* IAD: RNDIS, interfaces 0+1 */
+-	9, 4, 0, 0, 1, 0xef, 0x04, 0x01, 5,             /* control interface: notification EP */
++	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 5,             /* control: CDC ACM vendor veneer */
+ 	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 (ignored) */
+ 	5, 0x24, 0x01, 0x00, 0x01,                      /* call management (ignored) */
+ 	4, 0x24, 0x02, 0x00,                            /* ACM capabilities (ignored) */
+ 	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
+ 	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes */
+-	9, 4, 1, 0, 2, 0xef, 0x04, 0x01, 0,             /* data interface: two bulk, no altsetting */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,             /* data: CDC data, two bulk, no altsetting */
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ 	8, 0x0b, 2, 2, 0x02, 0x02, 0x00, 0,             /* IAD: CDC-ACM, interfaces 2+3 */
+@@ -1328,7 +1337,10 @@ ud_if_detach(ifnet_t ifp __unused)
+ {
+ }
+ 
+-/* ue0, 192.168.7.2/24 (the host side is 192.168.7.1). */
++/* ue0, 169.254.7.2/16: the Windows host has no administrator to set a
++ * static address, but it assigns an APIPA 169.254/16 address to the RNDIS
++ * adapter automatically. Link-local keeps 169.254.7.2 on-link for that
++ * host, so TCP/UDP reach us with no host-side configuration. */
+ static void
+ ud_if_create(void)
+ {
+@@ -1387,20 +1399,20 @@ ud_if_create(void)
+ 		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a->sin_addr.s_addr = htonl(0xa9fe0702);         /* 169.254.7.2 */
+ 		a = (struct sockaddr_in *)&ifra.ifra_mask;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xffffff00);
++		a->sin_addr.s_addr = htonl(0xffff0000);
+ 		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		a->sin_addr.s_addr = htonl(0xa9feffff);
+ 		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+ 		sock_close(so);
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	printf("SWEET USB: ue0 169.254.7.2/16 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
+ static void
