@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 88e5575..03b1879 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -324,6 +324,7 @@ static struct {
+ 	mbuf_t      txq[UD_TXQ];
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
++	uint32_t    tx_age;         /* ms since the EP_TX TRB was armed */
+ 	uint64_t    rx_frames, tx_frames;
+ 	/* RNDIS mode (sweetusbrndis=1): the control RPC is one command and
+ 	 * one answer at a time (the host serializes them), so one response
+@@ -1270,6 +1271,7 @@ ud_tx_kick_locked(void)
+ 			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+ 		}
+ 		ud.tx_busy = true;
++		ud.tx_age = 0;
+ 		ud.tx_frames++;
+ 		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
+ 	}
+@@ -1471,7 +1473,6 @@ ud_dhcp_reply(socket_t so, const uint8_t *req, uint8_t type)
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+ 	to.sin_port = htons(68);
+-	to.sin_addr.s_addr = htonl(0xc0a807ff);         /* 192.168.7.255 */
+ 	iov.iov_base = rep;
+ 	iov.iov_len = (size_t)(o - rep);
+ 	bzero(&msg, sizeof(msg));
+@@ -1479,10 +1480,17 @@ ud_dhcp_reply(socket_t so, const uint8_t *req, uint8_t type)
+ 	msg.msg_iovlen = 1;
+ 	msg.msg_name = &to;
+ 	msg.msg_namelen = sizeof(to);
+-	errno_t err = sock_send(so, &msg, 0, &sent);
+-	printf("SWEET DHCP: %s for %02x:%02x:%02x:%02x:%02x:%02x (send %d, %u B)\n",
++	/* The client still has APIPA 169.254/16, so 192.168.7.255 is not a
++	 * broadcast for its current interface and is dropped before UDP.
++	 * The limited broadcast is accepted without an address; send both. */
++	size_t sent1 = 0, sent2 = 0;
++	to.sin_addr.s_addr = 0xffffffffu;
++	errno_t err1 = sock_send(so, &msg, 0, &sent1);
++	to.sin_addr.s_addr = htonl(0xc0a807ff);         /* 192.168.7.255 */
++	errno_t err2 = sock_send(so, &msg, 0, &sent2);
++	printf("SWEET DHCP: %s for %02x:%02x:%02x:%02x:%02x:%02x (send %d/%d, %u B)\n",
+ 	    type == 2 ? "OFFER" : "ACK", req[28], req[29], req[30], req[31], req[32],
+-	    req[33], err, (unsigned)sent);
++	    req[33], err1, err2, (unsigned)sent1);
+ }
+ 
+ static void
+@@ -1686,6 +1694,23 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		/* The host does not always deliver the EP_TX completion (the
++		 * DHCP offer sat active from 15 s to 238 s in the 0176 run),
++		 * which stops every later frame behind tx_busy. Recover the
++		 * endpoint after 200 ms; the frame itself is already gone. */
++		if (ud.tx_busy && ++ud.tx_age > 200) {
++			lck_mtx_lock(ud.lock);
++			if (ud.tx_busy) {
++				static unsigned tx_watchdogs;
++				ud.tx_busy = false;
++				if (tx_watchdogs++ < 8) {
++					printf("SWEET USB: tx watchdog after %u ms\n", ud.tx_age);
++				}
++				ud_tx_kick_locked();
++			}
++			ud.tx_age = 0;
++			lck_mtx_unlock(ud.lock);
++		}
+ 		if ((++ticks % 10000) == 0) {
+ 			volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 			volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
