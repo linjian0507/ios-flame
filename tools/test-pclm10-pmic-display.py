@@ -15,7 +15,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "references/ios-flame-fork/work/dxb/xnu"
-PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0177-flame-pclm10-rndis-dhcp-broadcast-watchdog.patch"
+PATCH = ROOT / "references/ios-flame-fork/xnu/patches/0178-flame-pclm10-rndis-media-indicate.patch"
 SOURCE_FLAG = "--source" in sys.argv
 
 
@@ -161,6 +161,12 @@ int main(void) {
         # recognised by its IP stack; 192.168.7.255 is sent as fallback.
         self.assertIn("to.sin_addr.s_addr = 0xffffffffu;", src)
         self.assertIn("tx watchdog after %u ms", src)
+        # The interface's broadcast is the limited address so the DHCP
+        # send itself has a route; Windows starts its receive path on the
+        # f_rndis MEDIA_CONNECT indication.
+        self.assertIn("a->sin_addr.s_addr = htonl(0xffffffff);", src)
+        self.assertIn("RNDIS_STATUS_MEDIA_CONNECT    0x4001000bu", src)
+        self.assertIn("rndis media connect indication queued", src)
         # DWC3 EP0 OUT only completes a short data stage when the TRB
         # covers a full 64-byte max-packet slot (0173's 24-byte INIT
         # never produced XferComplete).
@@ -398,7 +404,7 @@ int main() {
             "bsd/dev/sweet_s3706.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_s3706.c",
             "bsd/dev/sweet_spmi.c": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.c",
             "bsd/dev/sweet_spmi.h": ROOT / "work/buildtree-0171-r42545717811/xnu/bsd/dev/sweet_spmi.h",
-            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0176/post/bsd/dev/sweet_usb.c",
+            "bsd/dev/sweet_usb.c": ROOT / "work/patch-0177/post/bsd/dev/sweet_usb.c",
             # 0173's preimage includes 0172's framebuffer changes.
             "iokit/Kernel/arm/SweetFramebuffer.cpp": ROOT / "work/patch-0172/post/iokit/Kernel/arm/SweetFramebuffer.cpp",
         }
